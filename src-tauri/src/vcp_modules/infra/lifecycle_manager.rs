@@ -12,7 +12,7 @@ use crate::vcp_modules::emoticon_manager::{
 use crate::vcp_modules::infra::local_server::{self, ServerHandle};
 use crate::vcp_modules::model_manager::{init_model_manager, ModelManagerState};
 use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
-use crate::vcp_modules::sync_service::init_sync_service;
+use crate::vcp_modules::sync_service::{init_sync_service, start_sync_internal};
 use crate::vcp_modules::vcp_log_service::init_vcp_log_connection_internal;
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
@@ -234,6 +234,18 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
     // 初始化同步服务
     let sync_state = init_sync_service(handle.clone());
     handle.manage(sync_state);
+    if !settings.sync_server_url.is_empty()
+        && !settings.sync_http_url.is_empty()
+        && !settings.sync_token.is_empty()
+    {
+        let h = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if let Err(error) = start_sync_internal(h).await {
+                log::warn!("[Lifecycle] Automatic sync startup failed: {}", error);
+            }
+        });
+    }
 
     // 4. 服务级后台初始化 (P2 - 非阻塞)
     {

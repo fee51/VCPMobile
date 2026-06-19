@@ -58,7 +58,7 @@ pub async fn save_avatar_data<R: Runtime>(
 
     // 4. 通知同步中心：本地数据已变动
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {
-        let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
+        sync_state.send_sync_command(SyncCommand::NotifyLocalChange {
             id: format!("{}:{}", owner_type, owner_id),
             data_type: SyncDataType::Avatar,
             hash: avatar_hash.clone(),

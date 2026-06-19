@@ -147,7 +147,7 @@ pub async fn get_topics_streamed(
 
 #[tauri::command]
 pub async fn create_topic(
-    _app_handle: AppHandle,
+    app_handle: AppHandle,
     db_state: State<'_, DbState>,
     owner_id: String,
     owner_type: String,
@@ -198,6 +198,20 @@ pub async fn create_topic(
     }
     tx.commit().await.map_err(|e| e.to_string())?;
 
+    if let Some(sync_state) = app_handle.try_state::<SyncState>() {
+        let row = sqlx::query("SELECT config_hash FROM topics WHERE topic_id = ?")
+            .bind(&id)
+            .fetch_one(&db_state.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        sync_state.send_sync_command(SyncCommand::NotifyLocalChange {
+            data_type: SyncDataType::Topic,
+            id: id.clone(),
+            hash: row.get("config_hash"),
+            ts: now,
+        });
+    }
+
     Ok(topic)
 }
 
@@ -219,7 +233,7 @@ pub async fn delete_topic(
         .map_err(|e| e.to_string())?;
 
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {
-        let _ = sync_state.ws_sender.send(SyncCommand::NotifyDelete {
+        sync_state.send_sync_command(SyncCommand::NotifyDelete {
             data_type: SyncDataType::Topic,
             id: topic_id.clone(),
         });
@@ -269,7 +283,7 @@ pub async fn update_topic_title(
             .map_err(|e| e.to_string())?;
 
         let hash: String = row.get("config_hash");
-        let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
+        sync_state.send_sync_command(SyncCommand::NotifyLocalChange {
             data_type: SyncDataType::Topic,
             id: topic_id,
             hash,
@@ -333,7 +347,7 @@ pub async fn toggle_topic_lock(
             .map_err(|e| e.to_string())?;
 
         let hash: String = row.get("config_hash");
-        let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
+        sync_state.send_sync_command(SyncCommand::NotifyLocalChange {
             data_type: SyncDataType::Topic,
             id: topic_id,
             hash,

@@ -425,7 +425,7 @@ async fn internal_write_group_config<R: Runtime>(
             });
 
             if old_hash.as_ref() != Some(&config_hash) {
-                let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
+                sync_state.send_sync_command(SyncCommand::NotifyLocalChange {
                     id: group_id.to_string(),
                     data_type: SyncDataType::Group,
                     hash: config_hash.clone(),
@@ -560,7 +560,7 @@ pub async fn delete_group(
     state.locks.remove(&group_id);
 
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {
-        let _ = sync_state.ws_sender.send(SyncCommand::NotifyDelete {
+        sync_state.send_sync_command(SyncCommand::NotifyDelete {
             data_type: SyncDataType::Group,
             id: group_id.clone(),
         });

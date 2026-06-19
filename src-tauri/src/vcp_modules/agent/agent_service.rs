@@ -338,7 +338,7 @@ async fn internal_write_agent_config<R: Runtime>(
             });
 
             if old_hash.as_ref() != Some(&config_hash) {
-                let _ = sync_state.ws_sender.send(SyncCommand::NotifyLocalChange {
+                sync_state.send_sync_command(SyncCommand::NotifyLocalChange {
                     id: agent_id.to_string(),
                     data_type: SyncDataType::Agent,
                     hash: config_hash.clone(),
@@ -451,7 +451,7 @@ pub async fn delete_agent(
     state.locks.remove(&agent_id);
 
     if let Some(sync_state) = app_handle.try_state::<SyncState>() {
-        let _ = sync_state.ws_sender.send(SyncCommand::NotifyDelete {
+        sync_state.send_sync_command(SyncCommand::NotifyDelete {
             data_type: SyncDataType::Agent,
             id: agent_id.clone(),
         });

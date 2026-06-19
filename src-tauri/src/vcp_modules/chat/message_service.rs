@@ -681,6 +681,26 @@ pub async fn append_single_message<R: tauri::Runtime>(
         .map_err(|e| e.to_string())?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
+
+    if let Some(sync_state) =
+        app_handle.try_state::<crate::vcp_modules::sync_service::SyncState>()
+    {
+        let topic_hash: String =
+            sqlx::query_scalar("SELECT config_hash FROM topics WHERE topic_id = ?")
+                .bind(&topic_id)
+                .fetch_one(db_pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        sync_state.send_sync_command(
+            crate::vcp_modules::sync_service::SyncCommand::NotifyLocalChange {
+                id: topic_id,
+                data_type: crate::vcp_modules::sync_types::SyncDataType::Topic,
+                hash: topic_hash,
+                ts: now,
+            },
+        );
+    }
+
     Ok(blocks)
 }
 
