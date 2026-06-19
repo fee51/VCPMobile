@@ -548,7 +548,6 @@ async fn run_sync_session(
                 let manifest_responses_received = Arc::new(AtomicU32::new(0));
                 // 1: 基础 Metadata (agent, group, avatar), 2: Topic Metadata
                 let manifest_phase = Arc::new(AtomicU8::new(1));
-                let mut sync_success = false;
                 let mut sync_cycle_active = false;
                 let mut sync_cycle_pending = false;
 
@@ -1068,7 +1067,11 @@ async fn run_sync_session(
                         else => break,
                     }
                 }
-                if sync_success {
+                if !handle_clone
+                    .state::<SyncState>()
+                    .is_syncing
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
                     break; // 同步完成，退出外层 loop
                 } else {
                     // 同步未成功完成，但内层循环已跳出（说明中途断网）

@@ -682,24 +682,13 @@ pub async fn append_single_message<R: tauri::Runtime>(
 
     tx.commit().await.map_err(|e| e.to_string())?;
 
-    if let Some(sync_state) =
-        app_handle.try_state::<crate::vcp_modules::sync_service::SyncState>()
-    {
-        let topic_hash: String =
-            sqlx::query_scalar("SELECT config_hash FROM topics WHERE topic_id = ?")
-                .bind(&topic_id)
-                .fetch_one(db_pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        sync_state.send_sync_command(
-            crate::vcp_modules::sync_service::SyncCommand::NotifyLocalChange {
-                id: topic_id,
-                data_type: crate::vcp_modules::sync_types::SyncDataType::Topic,
-                hash: topic_hash,
-                ts: now,
-            },
-        );
-    }
+    notify_topic_sync(
+        &app_handle,
+        db_pool,
+        &topic_id,
+        message.timestamp as i64,
+    )
+    .await?;
 
     Ok(blocks)
 }
@@ -819,7 +808,35 @@ pub async fn patch_single_message<R: tauri::Runtime>(
         .map_err(|e| e.to_string())?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
+    notify_topic_sync(&app_handle, db_pool, &topic_id, now).await?;
     Ok(blocks)
+}
+
+async fn notify_topic_sync<R: tauri::Runtime>(
+    app_handle: &AppHandle<R>,
+    db_pool: &sqlx::Pool<sqlx::Sqlite>,
+    topic_id: &str,
+    timestamp: i64,
+) -> Result<(), String> {
+    if let Some(sync_state) =
+        app_handle.try_state::<crate::vcp_modules::sync_service::SyncState>()
+    {
+        let topic_hash: String =
+            sqlx::query_scalar("SELECT config_hash FROM topics WHERE topic_id = ?")
+                .bind(topic_id)
+                .fetch_one(db_pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        sync_state.send_sync_command(
+            crate::vcp_modules::sync_service::SyncCommand::NotifyLocalChange {
+                id: topic_id.to_string(),
+                data_type: crate::vcp_modules::sync_types::SyncDataType::Topic,
+                hash: topic_hash,
+                ts: timestamp,
+            },
+        );
+    }
+    Ok(())
 }
 
 pub async fn delete_messages(
