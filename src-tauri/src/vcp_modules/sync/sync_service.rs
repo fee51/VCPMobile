@@ -229,7 +229,6 @@ async fn run_sync_session(
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let mut retry_count = 0u32;
-    const MAX_RETRIES: u32 = 3;
     let mut retry_delay = Duration::from_millis(500);
 
     let db = app_handle.state::<DbState>();
@@ -1076,21 +1075,10 @@ async fn run_sync_session(
                 } else {
                     // 同步未成功完成，但内层循环已跳出（说明中途断网）
                     retry_count += 1;
-                    if retry_count >= MAX_RETRIES {
-                        let err_msg = "同步中途异常断开，已达到最大重试次数";
-                        publish_sync_status(
-                            &handle_clone,
-                            &connection_status_for_task,
-                            "error",
-                            err_msg,
-                        )
-                        .await;
-                        break;
-                    }
-                    let backoff = retry_delay * 2u32.pow(retry_count - 1);
+                    let backoff = Duration::from_secs((1u64 << retry_count.min(5)).min(30));
                     let err_msg = format!(
-                        "同步中途异常断开，{:?} 后尝试重新连接... (次数: {}/{})",
-                        backoff, retry_count, MAX_RETRIES
+                        "同步连接中断，{:?} 后自动重新连接... (第 {} 次)",
+                        backoff, retry_count
                     );
                     emit_sync_log(&handle_clone, "warn", &err_msg);
                     if !handle_clone
@@ -1114,18 +1102,10 @@ async fn run_sync_session(
             Err(e) => {
                 let err_detail = e.to_string();
                 retry_count += 1;
-                if retry_count >= MAX_RETRIES {
-                    let err_msg = format!("连接失败，已达到最大重试次数 | {}", err_detail);
-                    publish_sync_status(
-                        &handle_clone,
-                        &connection_status_for_task,
-                        "error",
-                        &err_msg,
-                    )
-                    .await;
-                    break;
-                }
-                let warn_msg = format!("连接失败，第 {} 次重试 | {}", retry_count, err_detail);
+                let warn_msg = format!(
+                    "连接失败，将持续自动重试 (第 {} 次) | {}",
+                    retry_count, err_detail
+                );
                 emit_sync_log(&handle_clone, "warning", &warn_msg);
                 if !handle_clone
                     .state::<SyncState>()
@@ -1142,7 +1122,7 @@ async fn run_sync_session(
                 {
                     break;
                 }
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
             }
         }
     }

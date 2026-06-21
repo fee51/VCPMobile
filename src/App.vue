@@ -309,6 +309,9 @@ const handleVcpLifecycle = (e: Event) => {
     invoke("set_vcp_log_heartbeat", { intervalMs: 15000 }).catch((err) => {
       console.error("[Lifecycle] Failed to restore foreground heartbeat:", err);
     });
+    invoke("start_manual_sync").catch((err) => {
+      console.error("[Lifecycle] Failed to resume automatic sync:", err);
+    });
     lifecycleStore.hydrateSystemStatus().catch((err) => {
       console.error("[Lifecycle] Failed to hydrate system status:", err);
     });
