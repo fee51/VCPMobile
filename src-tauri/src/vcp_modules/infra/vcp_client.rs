@@ -113,6 +113,50 @@ impl StreamEvent {
     }
 }
 
+fn sse_data_payload(line: &str) -> Option<&str> {
+    line.trim_start().strip_prefix("data:").map(str::trim_start)
+}
+
+fn extract_stream_text(chunk: &Value) -> String {
+    let mut text = String::new();
+
+    if let Some(choice) = chunk["choices"]
+        .as_array()
+        .and_then(|choices| choices.first())
+    {
+        let content = &choice["delta"]["content"];
+        if let Some(value) = content.as_str() {
+            text.push_str(value);
+        } else if let Some(parts) = content.as_array() {
+            for part in parts {
+                if let Some(value) = part.as_str() {
+                    text.push_str(value);
+                } else if let Some(value) = part["text"].as_str() {
+                    text.push_str(value);
+                }
+            }
+        }
+
+        if text.is_empty() {
+            if let Some(value) = choice["message"]["content"].as_str() {
+                text.push_str(value);
+            } else if let Some(value) = choice["text"].as_str() {
+                text.push_str(value);
+            }
+        }
+    }
+
+    if text.is_empty() {
+        if let Some(value) = chunk["delta"].as_str() {
+            text.push_str(value);
+        } else if let Some(value) = chunk["content"].as_str() {
+            text.push_str(value);
+        }
+    }
+
+    text
+}
+
 /// 全局活跃请求管理器，使用 DashMap 存储中止信号发送端
 /// messageId -> oneshot::Sender
 pub struct ActiveRequests(pub Arc<DashMap<String, oneshot::Sender<()>>>);
@@ -659,8 +703,8 @@ pub async fn perform_vcp_request<R: Runtime>(
                                     match line_res {
                                         Some(Ok(line)) => {
                                             if line.trim().is_empty() { continue; }
-                                            if line.starts_with("data: ") {
-                                                let data = line.trim_start_matches("data: ").trim();
+                                            if let Some(data) = sse_data_payload(&line) {
+                                                let data = data.trim();
                                                 if data == "[DONE]" {
                                                     log::debug!("[VCPClient] Stream finished normally with [DONE] for message: {}", message_id_inner);
                                                     aurora_buffer.finalize();
@@ -669,12 +713,8 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                 }
                                                 if let Ok(chunk) = serde_json::from_str::<Value>(data) {
                                                     // 累加全量内容并驱动 Aurora 沉淀
-                                                    let mut text_chunk = String::new();
+                                                    let text_chunk = extract_stream_text(&chunk);
                                                     if let Some(choice) = chunk["choices"].as_array().and_then(|a| a.first()) {
-                                                        if let Some(text) = choice["delta"]["content"].as_str() {
-                                                            full_content.push_str(text);
-                                                            text_chunk.push_str(text);
-                                                        }
                                                         if let Some(reason) = choice["finish_reason"].as_str() {
                                                             last_finish_reason = Some(
                                                                 if reason == "stop" { "completed".to_string() } else { reason.to_string() }
@@ -683,6 +723,7 @@ pub async fn perform_vcp_request<R: Runtime>(
                                                     }
 
                                                     if !text_chunk.is_empty() {
+                                                        full_content.push_str(&text_chunk);
                                                         aurora_buffer.append_chunk(&text_chunk);
                                                         let (stable_changed, tail_changed) = aurora_buffer.process_queue();
                                                         if stable_changed || (tail_changed && last_aurora_send.elapsed().as_millis() >= 33) {
@@ -794,6 +835,38 @@ pub async fn perform_vcp_request<R: Runtime>(
             .await
             .map_err(|e| format!("JSON解析失败: {}", e))?;
         Ok((json!({"response": vcp_response, "context": context}), false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_stream_text, sse_data_payload};
+    use serde_json::json;
+
+    #[test]
+    fn accepts_sse_data_with_or_without_space() {
+        assert_eq!(sse_data_payload("data: hello"), Some("hello"));
+        assert_eq!(sse_data_payload("data:hello"), Some("hello"));
+        assert_eq!(sse_data_payload("  data: hello"), Some("hello"));
+        assert_eq!(sse_data_payload("event: message"), None);
+    }
+
+    #[test]
+    fn extracts_common_stream_content_shapes() {
+        assert_eq!(
+            extract_stream_text(&json!({"choices":[{"delta":{"content":"hello"}}]})),
+            "hello"
+        );
+        assert_eq!(
+            extract_stream_text(
+                &json!({"choices":[{"delta":{"content":[{"type":"text","text":"hi"}]}}]})
+            ),
+            "hi"
+        );
+        assert_eq!(
+            extract_stream_text(&json!({"delta":"response-api"})),
+            "response-api"
+        );
     }
 }
 

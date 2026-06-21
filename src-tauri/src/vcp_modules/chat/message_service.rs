@@ -979,6 +979,13 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
     let mut final_content = full_content;
     if is_aborted {
         final_content.push_str("\n\n> VCP流式错误: 请求已中止");
+    } else if final_content.trim().is_empty() {
+        log::error!(
+            "[StreamFinalizer] Refusing to persist an empty assistant response: message_id={}",
+            message_id
+        );
+        final_content =
+            "> VCP流式错误: 已收到回复结束信号，但没有解析到正文。请重试此消息。".to_string();
     }
 
     // 1. 查询时间锚定机制 V2 的启用状态，仅在启用时才开启正则，避免不必要开销
