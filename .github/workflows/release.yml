@@ -87,6 +87,23 @@ jobs:
           echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > "${ANDROID_KEYSTORE_PATH}"
           test -s "${ANDROID_KEYSTORE_PATH}"
 
+      - name: Resolve Android key alias
+        shell: bash
+        run: |
+          RESOLVED_KEY_ALIAS=$(keytool -list -v \
+            -keystore "${ANDROID_KEYSTORE_PATH}" \
+            -storepass "${ANDROID_KEYSTORE_PASSWORD}" \
+            | sed -n 's/^Alias name: //p' \
+            | head -n 1)
+
+          if [[ -z "${RESOLVED_KEY_ALIAS}" ]]; then
+            echo "No private key alias found in Android keystore" >&2
+            exit 1
+          fi
+
+          echo "::add-mask::${RESOLVED_KEY_ALIAS}"
+          echo "ANDROID_KEY_ALIAS=${RESOLVED_KEY_ALIAS}" >> "$GITHUB_ENV"
+
       - name: Build Android APKs
         shell: bash
         env:
