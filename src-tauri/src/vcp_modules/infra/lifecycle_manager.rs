@@ -1,147 +1,25 @@
 use log::info;
 use serde::Serialize;
-use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::RwLock;
 
 use crate::vcp_modules::db_manager::{init_db, DbState};
 use crate::vcp_modules::emoticon_manager::{
     internal_load_library, refresh_emoticon_library_internal, EmoticonManagerState,
 };
-use crate::vcp_modules::infra::local_server::{self, ServerHandle};
 use crate::vcp_modules::model_manager::{init_model_manager, ModelManagerState};
 use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
 use crate::vcp_modules::sync_service::{init_sync_service, start_sync_internal};
 use crate::vcp_modules::vcp_log_service::init_vcp_log_connection_internal;
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum CoreStatus {
-    Initializing,
-    Ready,
-    // Syncing,
-    Error,
-}
-
-pub struct LifecycleState {
-    pub status: Arc<RwLock<CoreStatus>>,
-    pub last_error: Arc<RwLock<Option<String>>>,
-    /// 划词助手本地服务器句柄：用于根据设置动态启停
-    pub local_server_handle: Arc<tokio::sync::Mutex<Option<ServerHandle>>>,
-}
-
-impl LifecycleState {
-    pub fn new() -> Self {
-        Self {
-            status: Arc::new(RwLock::new(CoreStatus::Initializing)),
-            last_error: Arc::new(RwLock::new(None)),
-            local_server_handle: Arc::new(tokio::sync::Mutex::new(None)),
-        }
-    }
-}
-
-/// 根据设置决定启动或停止划词助手本地服务器
-pub async fn reconcile_local_server(
-    app_handle: &AppHandle,
-    lifecycle: &LifecycleState,
-    enable_assistant: bool,
-) {
-    let mut handle_lock = lifecycle.local_server_handle.lock().await;
-    let has_server = handle_lock.is_some();
-
-    match (enable_assistant, has_server) {
-        (true, false) => {
-            log::info!("[Lifecycle] enableAssistant=true, starting local server...");
-            *handle_lock = Some(local_server::start_server(app_handle.clone()));
-        }
-        (false, true) => {
-            log::info!("[Lifecycle] enableAssistant=false, stopping local server...");
-            if let Some(h) = handle_lock.take() {
-                h.shutdown().await;
-            }
-        }
-        _ => {
-            // 无需变更
-        }
-    }
-}
-
-/// 根据设置决定启动或停止分布式节点连接
-pub async fn reconcile_distributed_node(
-    app_handle: &AppHandle,
-    distributed_enabled: bool,
-    force_reconnect: bool,
-) {
-    let distributed_state = match app_handle.try_state::<crate::distributed::DistributedState>() {
-        Some(s) => s,
-        None => {
-            log::warn!("[Lifecycle] DistributedState not registered, skipping reconciliation");
-            return;
-        }
-    };
-    let client = distributed_state.client.read().await;
-
-    // 读取全局 settings，获取连接参数
-    let settings_state = app_handle.state::<SettingsState>();
-    let settings = match read_settings(app_handle.clone(), settings_state).await {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!(
-                "[Lifecycle] Failed to read settings for distributed reconnect: {}",
-                e
-            );
-            return;
-        }
-    };
-
-    let ws_url = settings.distributed_ws_url.clone();
-    let vcp_key = settings.distributed_vcp_key.clone();
-    let device_name = if settings.distributed_device_name.is_empty() {
-        "VCPMobile".to_string()
-    } else {
-        settings.distributed_device_name.clone()
-    };
-
-    let mut is_running = client.is_running().await;
-    if force_reconnect && is_running {
-        log::info!("[Lifecycle] Connection settings changed, stopping existing connection for reconnect...");
-        client.stop(app_handle).await;
-        is_running = false;
-    }
-
-    match (distributed_enabled, is_running) {
-        (true, false) => {
-            if ws_url.is_empty() || vcp_key.is_empty() {
-                log::warn!("[Lifecycle] distributedEnabled=true but ws_url/vcp_key is empty, skipping auto-connect");
-                return;
-            }
-            log::info!(
-                "[Lifecycle] distributedEnabled=true, starting distributed node connection..."
-            );
-            distributed_state.registry.load_disabled_config(app_handle);
-            if let Err(e) = client
-                .start(
-                    app_handle.clone(),
-                    ws_url,
-                    vcp_key,
-                    device_name,
-                    distributed_state.registry.clone(),
-                )
-                .await
-            {
-                log::error!("[Lifecycle] Auto-start distributed node failed: {}", e);
-            }
-        }
-        (false, true) => {
-            log::info!(
-                "[Lifecycle] distributedEnabled=false, stopping distributed node connection..."
-            );
-            client.stop(app_handle).await;
-        }
-        _ => {}
-    }
-}
+// Re-export submodules to preserve public API compatibility
+pub use crate::vcp_modules::infra::lifecycle_controller::{
+    is_app_in_foreground, set_app_foreground_state, set_app_foreground_state_internal,
+};
+pub use crate::vcp_modules::infra::lifecycle_reconciler::{
+    reconcile_distributed_node, reconcile_local_server,
+};
+pub use crate::vcp_modules::infra::lifecycle_state::{CoreStatus, LifecycleState};
 
 /// 核心启动逻辑：线性化管理所有服务的初始化顺序
 pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
@@ -168,6 +46,33 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
                 pool: p.clone(),
                 path,
             });
+
+            // 运行数据库解压升级迁移 (若有旧版压缩数据，将在此处展示进度并安全拦截启动流程)
+            match crate::vcp_modules::db_manager::decompress_database_migration(&handle).await {
+                Ok(true) => {
+                    log::info!("[Lifecycle] Decompress database migration completed. Halting boot sequence for restart.");
+                    return Ok(());
+                }
+                Ok(false) => {
+                    // 不需要解压迁移，继续引导
+                }
+                Err(e) => {
+                    let err_msg = format!("数据库解压迁移失败: {}", e);
+                    *lifecycle.last_error.write().await = Some(err_msg.clone());
+                    *lifecycle.status.write().await = CoreStatus::Error;
+                    let _ = handle.emit(
+                        "vcp-system-event",
+                        serde_json::json!({
+                            "type": "vcp-core-status",
+                            "status": "error",
+                            "message": &err_msg,
+                            "source": "Core"
+                        }),
+                    );
+                    return Err(err_msg);
+                }
+            }
+
             p
         }
         Err(e) => {
@@ -211,14 +116,12 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
         }
     };
 
-    // 3.5 根据设置决定是否启动划词助手本地服务器 (Beta)
+    // 3.5 根据设置决定是否启动划词助手本地服务器 (Beta) - 暂时停用该功能
     {
-        let enable = settings.enable_assistant;
         log::info!(
-            "[Lifecycle] enableAssistant={}, reconciling local server...",
-            enable
+            "[Lifecycle] enableAssistant=false (temporarily disabled), reconciling local server..."
         );
-        reconcile_local_server(&handle, &lifecycle, enable).await;
+        reconcile_local_server(&handle, &lifecycle, false).await;
     }
 
     // 3.6 根据设置决定是否启动分布式节点 (自动重连)
@@ -261,7 +164,7 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
             }
 
             // Best-effort refresh from server (does not block startup)
-            match refresh_emoticon_library_internal(&h).await {
+            match refresh_emoticon_library_internal(&h, false).await {
                 Ok(count) => info!(
                     "[Lifecycle] Emoticon library auto-refreshed: {} items",
                     count
@@ -275,8 +178,12 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
                 let _ =
                     init_vcp_log_connection_internal(h.clone(), s_url.clone(), s_key.clone()).await;
                 info!("[Lifecycle] Auto-connecting VCP Info...");
-                let _ = super::vcp_info_service::init_vcp_info_connection(h.clone(), s_url, s_key)
-                    .await;
+                let _ = crate::vcp_modules::vcp_info_service::init_vcp_info_connection(
+                    h.clone(),
+                    s_url,
+                    s_key,
+                )
+                .await;
             }
         });
     }
@@ -296,12 +203,60 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
         tokio::spawn(async move {
             // 启动延时 10 秒后执行首航清理，完美避开冷启动黄金 IO 密集期
             tokio::time::sleep(Duration::from_secs(10)).await;
-            use crate::vcp_modules::sync_executor::delete_executor::DeleteExecutor;
-            let _ = DeleteExecutor::cleanup_old_deleted_records(&h, 30).await;
+
+            let db_state = h.state::<DbState>();
+            let pool = &db_state.pool;
+
+            let mut should_cleanup = true;
+            {
+                use sqlx::Row;
+                if let Ok(Some(row)) = sqlx::query(
+                    "SELECT value FROM settings WHERE key = 'delete_executor_last_cleanup'",
+                )
+                .fetch_optional(pool)
+                .await
+                {
+                    let last_cleanup_str: String = row.get("value");
+                    if let Ok(last_cleanup) = last_cleanup_str.parse::<i64>() {
+                        let now = crate::vcp_modules::infra::utils::now_millis();
+                        // 24h = 86_400_000 ms
+                        if now - last_cleanup < 86_400_000 {
+                            log::info!("[Lifecycle] DeleteExecutor last cleanup ran at {} (less than 24h ago). Skipping startup cleanup.", last_cleanup);
+                            should_cleanup = false;
+                        }
+                    }
+                }
+            }
+
+            if should_cleanup {
+                use crate::vcp_modules::sync_executor::delete_executor::DeleteExecutor;
+                if DeleteExecutor::cleanup_old_deleted_records(&h, 30)
+                    .await
+                    .is_ok()
+                {
+                    let now = crate::vcp_modules::infra::utils::now_millis();
+                    let _ = sqlx::query("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('delete_executor_last_cleanup', ?, ?)")
+                        .bind(now.to_string())
+                        .bind(now)
+                        .execute(pool)
+                        .await;
+                }
+            }
 
             loop {
                 tokio::time::sleep(Duration::from_secs(86400)).await;
-                let _ = DeleteExecutor::cleanup_old_deleted_records(&h, 30).await;
+                use crate::vcp_modules::sync_executor::delete_executor::DeleteExecutor;
+                if DeleteExecutor::cleanup_old_deleted_records(&h, 30)
+                    .await
+                    .is_ok()
+                {
+                    let now = crate::vcp_modules::infra::utils::now_millis();
+                    let _ = sqlx::query("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('delete_executor_last_cleanup', ?, ?)")
+                        .bind(now.to_string())
+                        .bind(now)
+                        .execute(pool)
+                        .await;
+                }
             }
         });
     }
@@ -339,52 +294,88 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
         let h = handle.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            info!("[FrontendUpdate] Starting background check...");
 
-            match crate::vcp_modules::frontend_update_manager::check_for_frontend_update(h.clone())
-                .await
+            let db_state = h.state::<DbState>();
+            let pool = &db_state.pool;
+
+            let mut skip_check = false;
             {
-                Ok(info) => {
-                    if info.has_update {
-                        if let Some(url) = info.download_url {
-                            info!(
-                                "[FrontendUpdate] New version available: {}, downloading...",
-                                info.remote_version
-                            );
-                            match crate::vcp_modules::frontend_update_manager::download_frontend_update_inner(
-                                &h,
-                                &url,
-                                None,
-                            )
-                            .await
-                            {
-                                Ok(zip_path) => {
-                                    if let Err(e) = crate::vcp_modules::frontend_update_manager::apply_frontend_update(
-                                        h.clone(),
-                                        zip_path,
-                                        info.remote_version.clone(),
-                                    )
-                                    .await
-                                    {
-                                        log::error!("[FrontendUpdate] Apply failed: {}", e);
-                                    } else {
-                                        info!(
-                                            "[FrontendUpdate] Version {} downloaded and applied. Will take effect on next cold start.",
-                                            info.remote_version
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("[FrontendUpdate] Download failed: {}", e);
-                                }
-                            }
+                use sqlx::Row;
+                if let Ok(Some(row)) = sqlx::query(
+                    "SELECT value FROM settings WHERE key = 'frontend_update_last_check'",
+                )
+                .fetch_optional(pool)
+                .await
+                {
+                    let last_check_str: String = row.get("value");
+                    if let Ok(last_check) = last_check_str.parse::<i64>() {
+                        let now = crate::vcp_modules::infra::utils::now_millis();
+                        // 24h = 86_400_000 ms
+                        if now - last_check < 86_400_000 {
+                            log::info!("[FrontendUpdate] Last check ran at {} (less than 24h ago). Skipping startup check.", last_check);
+                            skip_check = true;
                         }
-                    } else {
-                        info!("[FrontendUpdate] No frontend update available.");
                     }
                 }
-                Err(e) => {
-                    log::error!("[FrontendUpdate] Check failed: {}", e);
+            }
+
+            if !skip_check {
+                info!("[FrontendUpdate] Starting background check...");
+                match crate::vcp_modules::frontend_update_manager::check_for_frontend_update(
+                    h.clone(),
+                )
+                .await
+                {
+                    Ok(info) => {
+                        // 更新最后检查时间戳
+                        let now = crate::vcp_modules::infra::utils::now_millis();
+                        let _ = sqlx::query("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('frontend_update_last_check', ?, ?)")
+                            .bind(now.to_string())
+                            .bind(now)
+                            .execute(pool)
+                            .await;
+
+                        if info.has_update {
+                            if let Some(url) = info.download_url {
+                                info!(
+                                    "[FrontendUpdate] New version available: {}, downloading...",
+                                    info.remote_version
+                                );
+                                match crate::vcp_modules::frontend_update_manager::download_frontend_update_inner(
+                                    &h,
+                                    &url,
+                                    None,
+                                )
+                                .await
+                                {
+                                    Ok(zip_path) => {
+                                        if let Err(e) = crate::vcp_modules::frontend_update_manager::apply_frontend_update(
+                                            h.clone(),
+                                            zip_path,
+                                            info.remote_version.clone(),
+                                        )
+                                        .await
+                                        {
+                                            log::error!("[FrontendUpdate] Apply failed: {}", e);
+                                        } else {
+                                            info!(
+                                                "[FrontendUpdate] Version {} downloaded and applied. Will take effect on next cold start.",
+                                                info.remote_version
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!("[FrontendUpdate] Download failed: {}", e);
+                                    }
+                                }
+                            }
+                        } else {
+                            info!("[FrontendUpdate] No frontend update available.");
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("[FrontendUpdate] Check failed: {}", e);
+                    }
                 }
             }
         });
@@ -396,6 +387,7 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
 #[derive(Debug, Serialize, Clone)]
 pub struct SystemSnapshot {
     pub core: CoreStatus,
+    pub message: String,
     pub log: String,
     pub sync: String,
     pub distributed: String,
@@ -407,6 +399,7 @@ pub async fn get_system_snapshot(
     app: AppHandle,
 ) -> Result<SystemSnapshot, String> {
     let core = *state.status.read().await;
+    let message = state.status_message.read().await.clone();
 
     // 获取 VCPLog 状态
     let log = crate::vcp_modules::vcp_log_service::get_vcp_log_status_internal().await;
@@ -433,13 +426,14 @@ pub async fn get_system_snapshot(
 
     Ok(SystemSnapshot {
         core,
+        message,
         log,
         sync,
         distributed,
     })
 }
 
-/// 前端保存设置后调用，即时生效启用/停用划词助手本地服务器
+/// 前端保存设置后调用，即时生效启用/停用划词助手本地服务器 - 暂时停用该功能
 #[tauri::command]
 pub async fn reconcile_local_server_cmd(
     app_handle: AppHandle,
@@ -447,25 +441,27 @@ pub async fn reconcile_local_server_cmd(
     enable: bool,
 ) -> Result<bool, String> {
     log::info!(
-        "[Lifecycle] reconcile_local_server_cmd called: enable={}",
+        "[Lifecycle] reconcile_local_server_cmd called (temporarily disabled): enable={}",
         enable
     );
     let lifecycle = &*state;
-    reconcile_local_server(&app_handle, lifecycle, enable).await;
-    Ok(enable)
+    reconcile_local_server(&app_handle, lifecycle, false).await;
+    Ok(false)
 }
 
 #[tauri::command]
-pub async fn reconcile_distributed_node_cmd(
-    app_handle: AppHandle,
-    enable: bool,
-) -> Result<bool, String> {
+pub async fn reconcile_distributed_node_cmd(app_handle: AppHandle) -> Result<bool, String> {
+    // 读取全局 settings，对齐当前状态
+    let settings_state = app_handle.state::<SettingsState>();
+    let settings = read_settings(app_handle.clone(), settings_state)
+        .await
+        .map_err(|e| e.to_string())?;
     log::info!(
         "[Lifecycle] reconcile_distributed_node_cmd called: enable={}",
-        enable
+        settings.distributed_enabled
     );
-    reconcile_distributed_node(&app_handle, enable, false).await;
-    Ok(enable)
+    reconcile_distributed_node(&app_handle, settings.distributed_enabled, true).await;
+    Ok(settings.distributed_enabled)
 }
 
 #[tauri::command]
@@ -476,4 +472,117 @@ pub async fn get_core_status(state: State<'_, LifecycleState>) -> Result<CoreSta
 #[tauri::command]
 pub async fn get_last_error(state: State<'_, LifecycleState>) -> Result<Option<String>, String> {
     Ok(state.last_error.read().await.clone())
+}
+
+#[tauri::command]
+pub async fn restart_or_exit_app(
+    #[allow(unused_variables)] app: tauri::AppHandle,
+) -> Result<(), String> {
+    log::info!("[Lifecycle] Requesting application restart/exit...");
+
+    #[cfg(target_os = "android")]
+    {
+        use tokio::sync::oneshot;
+        let (tx, rx) = oneshot::channel();
+
+        let window = app
+            .get_webview_window("main")
+            .ok_or("main window not found")?;
+        let res = window.as_ref().with_webview(move |webview| {
+            webview.jni_handle().exec(move |env, activity, _webview| {
+                match restart_android_app(env, &activity) {
+                    Ok(_) => {
+                        let _ = tx.send(());
+                    }
+                    Err(e) => {
+                        log::error!("[Lifecycle] Restart JNI failed: {}", e);
+                        std::process::exit(0);
+                    }
+                }
+            });
+        });
+
+        if let Err(e) = res {
+            log::error!("[Lifecycle] with_webview failed: {:?}", e);
+            std::process::exit(0);
+        }
+
+        // 等待 JNI 线程成功调用并完成 startActivity Binder IPC
+        if let Ok(_) = rx.await {
+            // 给系统 Binder 一点时间刷盘并调度拉起新进程，然后自杀
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        std::process::exit(0);
+    }
+}
+
+#[cfg(target_os = "android")]
+fn restart_android_app(
+    env: &mut jni::JNIEnv<'_>,
+    activity: &jni::objects::JObject<'_>,
+) -> Result<(), String> {
+    use jni::objects::JValue;
+
+    // 1. Get Context
+    let context = env
+        .call_method(
+            activity,
+            "getApplicationContext",
+            "()Landroid/content/Context;",
+            &[],
+        )
+        .map_err(|e| format!("getApplicationContext failed: {:?}", e))?
+        .l()
+        .map_err(|e| format!("getApplicationContext returned non-object: {:?}", e))?;
+
+    // 2. Get PackageManager
+    let pm = env
+        .call_method(
+            &context,
+            "getPackageManager",
+            "()Landroid/content/pm/PackageManager;",
+            &[],
+        )
+        .map_err(|e| format!("getPackageManager failed: {:?}", e))?
+        .l()
+        .map_err(|e| format!("getPackageManager returned non-object: {:?}", e))?;
+
+    // 3. Get PackageName
+    let package_name = env
+        .call_method(&context, "getPackageName", "()Ljava/lang/String;", &[])
+        .map_err(|e| format!("getPackageName failed: {:?}", e))?
+        .l()
+        .map_err(|e| format!("getPackageName returned non-object: {:?}", e))?;
+
+    // 4. Get Launch Intent
+    let intent = env
+        .call_method(
+            &pm,
+            "getLaunchIntentForPackage",
+            "(Ljava/lang/String;)Landroid/content/Intent;",
+            &[JValue::Object(&package_name)],
+        )
+        .map_err(|e| format!("getLaunchIntentForPackage failed: {:?}", e))?
+        .l()
+        .map_err(|e| format!("getLaunchIntentForPackage returned non-object: {:?}", e))?;
+
+    if intent.is_null() {
+        return Err("Launch intent not found".to_string());
+    }
+
+    // 5. Start Activity
+    env.call_method(
+        &context,
+        "startActivity",
+        "(Landroid/content/Intent;)V",
+        &[JValue::Object(&intent)],
+    )
+    .map_err(|e| format!("startActivity failed: {:?}", e))?;
+
+    Ok(())
 }

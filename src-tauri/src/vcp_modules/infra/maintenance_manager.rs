@@ -3,7 +3,8 @@
 
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::file_manager::{
-    delete_attachment_physical, get_attachments_root_dir, get_thumbnails_root_dir,
+    delete_attachment_physical, get_attachments_root_dir, get_multimodal_cache_dir,
+    get_thumbnails_root_dir,
 };
 use crate::vcp_modules::infra::utils::{is_valid_cas_hash, now_secs, YieldCounter};
 use crate::vcp_modules::settings_manager::{read_settings, update_settings, SettingsState};
@@ -91,21 +92,35 @@ pub async fn cleanup_orphaned_attachments(
     let mut deleted_count = 0;
     let mut freed_size = 0u64;
 
-    // 1.5 先清理已删除消息的 message_attachments 关联 (防线三：GC 阶段关联自愈)
+    // 1.5 将已逻辑删除或所属消息/话题/智能体/群组已删除的 message_attachments 记录清空为无害的墓碑态 (清空敏感正文、src路径等)，但保留主键条目
     let _ = sqlx::query(
-        "DELETE FROM message_attachments WHERE (topic_id, msg_id) IN (\
-         SELECT ma.topic_id, ma.msg_id FROM message_attachments ma \
-         INNER JOIN messages m ON ma.topic_id = m.topic_id AND ma.msg_id = m.msg_id \
-         WHERE m.deleted_at IS NOT NULL)",
+        "UPDATE message_attachments \
+         SET display_name = '[附件已删除]', src = NULL, status = 'removed' \
+         WHERE deleted_at IS NOT NULL \
+            OR (topic_id, msg_id) IN (\
+                SELECT topic_id, msg_id FROM messages WHERE deleted_at IS NOT NULL\
+            ) \
+            OR topic_id IN (\
+                SELECT topic_id FROM topics WHERE deleted_at IS NOT NULL \
+                   OR owner_id IN (SELECT agent_id FROM agents WHERE deleted_at IS NOT NULL) AND owner_type = 'agent' \
+                   OR owner_id IN (SELECT group_id FROM groups WHERE deleted_at IS NOT NULL) AND owner_type = 'group' \
+            )",
     )
     .execute(&db_state.pool)
     .await;
 
-    // 2. 查 message_attachments 确定哪些 hash 正在被有效消息引用 (防线四：GC 强校验)
+    // 2. 查 message_attachments 确定哪些 hash 正在被有效消息引用 (防线四：GC 强校验，包含对 Topic/Agent/Group 存活链路的安全判定)
     let used_hashes: std::collections::HashSet<String> = sqlx::query_as::<_, (String,)>(
         "SELECT DISTINCT ma.hash FROM message_attachments ma \
              INNER JOIN messages m ON ma.topic_id = m.topic_id AND ma.msg_id = m.msg_id \
-             WHERE m.deleted_at IS NULL",
+             INNER JOIN topics t ON m.topic_id = t.topic_id \
+             LEFT JOIN agents a ON t.owner_id = a.agent_id AND t.owner_type = 'agent' \
+             LEFT JOIN groups g ON t.owner_id = g.group_id AND t.owner_type = 'group' \
+             WHERE m.deleted_at IS NULL \
+               AND ma.deleted_at IS NULL \
+               AND t.deleted_at IS NULL \
+               AND (t.owner_type != 'agent' OR a.deleted_at IS NULL) \
+               AND (t.owner_type != 'group' OR g.deleted_at IS NULL)",
     )
     .fetch_all(&db_state.pool)
     .await
@@ -224,6 +239,37 @@ pub async fn cleanup_orphaned_attachments(
         }
     }
 
+    // 4. 双向物理校验：清理无主多模态缓存 (.json 文件)
+    let mut cache_yield = YieldCounter::new(200);
+    if let Ok(cache_dir) = get_multimodal_cache_dir(&app_handle) {
+        if cache_dir.exists() {
+            if let Ok(mut entries) = tokio::fs::read_dir(&cache_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    cache_yield.tick().await;
+                    let path = entry.path();
+                    if path.is_file() {
+                        let file_name = entry.file_name().to_string_lossy().to_string();
+                        if file_name.ends_with(".json") && file_name.len() == 69 {
+                            let hash = file_name[..64].to_string();
+                            if !current_in_db_hashes.contains(&hash) {
+                                if let Ok(meta) = tokio::fs::metadata(&path).await {
+                                    ghost_freed_size += meta.len();
+                                }
+                                if tokio::fs::remove_file(&path).await.is_ok() {
+                                    ghost_deleted_count += 1;
+                                    log::info!(
+                                        "[Maintenance] GC swept ghost multimodal cache file: {}",
+                                        file_name
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let total_deleted = deleted_count + ghost_deleted_count;
     let total_freed_mb = ((freed_size + ghost_freed_size) as f64) / 1024.0 / 1024.0;
 
@@ -300,26 +346,7 @@ pub async fn cleanup_single_orphaned_attachment(
             .await
             .map_err(|e| e.to_string())?;
 
-    if let Some((path_str, created_at)) = row {
-        // ⚡ 5分钟安全锁宽限期 (300秒)
-        if is_within_safe_grace_period(created_at, 300) {
-            let elapsed = {
-                let target_secs = if created_at > 10_000_000_000 {
-                    created_at / 1000
-                } else {
-                    created_at
-                };
-                let now_secs = now_secs();
-                now_secs - target_secs
-            };
-            log::debug!(
-                "[Maintenance] Safe-Shield: Hash {} was created recently ({} secs ago). Skipping targeted GC to prevent race condition.",
-                hash,
-                elapsed
-            );
-            return Ok("附件创建不久，处于安全锁宽限期，跳过物理清理以防时序冲突".to_string());
-        }
-
+    if let Some((path_str, _)) = row {
         // 调用统一的物理删除原语，连同缩略图一并抹除
         let _ = delete_attachment_physical(&app_handle, &hash, &path_str).await;
 
@@ -338,6 +365,44 @@ pub async fn cleanup_single_orphaned_attachment(
 /// 3. 初始化自动维护逻辑 (在 App 启动时调用)
 ///    如果距离上次清理超过 3 天，则自动触发一次 WebView 缓存清理
 pub async fn init_automatic_maintenance(app: AppHandle) {
+    // 异步清理超过 24 小时的孤立 SSE 缓存文件，防止磁盘文件泄露
+    let app_clone = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Ok(cache_dir) = app_clone.path().app_cache_dir() else {
+            return;
+        };
+        let sse_cache_dir = cache_dir.join("sse_cache");
+        if !sse_cache_dir.exists() {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(sse_cache_dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            let Ok(elapsed) = modified.elapsed() else {
+                continue;
+            };
+            if elapsed.as_secs() > 24 * 3600 {
+                log::info!(
+                    "[Maintenance] Deleting orphaned SSE cache file older than 24 hours: {:?}",
+                    path
+                );
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    });
+
     let settings_state = app.state::<SettingsState>();
 
     // 获取当前设置
@@ -386,18 +451,4 @@ pub async fn init_automatic_maintenance(app: AppHandle) {
         let _ = update_settings(app.clone(), settings_state, updates).await;
         log::info!("[Maintenance] Scheduled maintenance complete.");
     }
-}
-
-/// 自适应兼容“秒级”与“毫秒级”时间戳，判定目标时间点是否在指定秒数的安全宽限期内
-fn is_within_safe_grace_period(target_timestamp: i64, grace_secs: i64) -> bool {
-    let target_secs = if target_timestamp > 10_000_000_000 {
-        target_timestamp / 1000 // 毫秒自动归一化为秒
-    } else {
-        target_timestamp
-    };
-
-    let now_secs = now_secs();
-
-    let diff = now_secs - target_secs;
-    diff >= 0 && diff < grace_secs
 }

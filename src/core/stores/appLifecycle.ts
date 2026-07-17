@@ -5,9 +5,13 @@ import { useAssistantStore } from './assistant';
 import { useSettingsStore } from './settings';
 import { useThemeStore } from './theme';
 import { useNotificationStore } from './notification';
+import { useChatSessionStore } from './chatSessionStore';
+import { useChatHistoryStore } from './chatHistoryStore';
+import { useTopicStore } from './topicListManager';
 import { updateDistributedState } from '../../features/distributed/composables/useDistributed';
+import { useAvatarStore } from './avatar';
 
-export type AppState = 'PERMISSIONS' | 'BOOTING' | 'CONNECTING' | 'PRELOADING' | 'READY' | 'ERROR';
+export type AppState = 'PERMISSIONS' | 'BOOTING' | 'CONNECTING' | 'PRELOADING' | 'READY' | 'ERROR' | 'MIGRATING' | 'MIGRATED';
 
 export interface CoreStatus {
   status: 'initializing' | 'ready' | 'error' | 'none';
@@ -25,11 +29,15 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
   const hasBootstrapped = ref(false);
   const currentPhaseLabel = ref('准备启动...');
   const lastTransitionAt = ref<number | null>(null);
+  const isBackground = ref(false);
+
+
 
   const assistantStore = useAssistantStore();
   const settingsStore = useSettingsStore();
   const themeStore = useThemeStore();
   const notificationStore = useNotificationStore();
+  const avatarStore = useAvatarStore();
 
   let bootstrapPromise: Promise<void> | null = null;
   let coreReadyUnlisten: (() => void) | null = null;
@@ -45,6 +53,10 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         return '正在连接核心服务...';
       case 'PRELOADING':
         return currentPhaseLabel.value || '正在预加载核心数据...';
+      case 'MIGRATING':
+        return '正在升级数据库...';
+      case 'MIGRATED':
+        return '数据库升级完成';
       case 'ERROR':
         return errorMsg.value || '启动失败';
       case 'READY':
@@ -124,10 +136,27 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
       updatePhaseLabel('正在并发预加载配置与助手数据...');
       console.log('[Lifecycle] [Concurrent] START Preloading Settings and AgentsAndGroups');
 
-      await Promise.all([
+      const sessionStore = useChatSessionStore();
+      const topicStore = useTopicStore();
+
+      const promises: Promise<any>[] = [
         settingsStore.fetchSettings(),
-        assistantStore.fetchAgentsAndGroups()
-      ]);
+        assistantStore.fetchAgentsAndGroups(),
+        avatarStore.preloadAll()
+      ];
+
+      // 启动预加载：若 Pinia 恢复了活跃会话，提前拉取首屏聊天历史
+      // 让 DB + IPC 开销与 Vue 组件挂载并行，ChatView mount 后直接命中缓存（零延迟）
+      if (sessionStore.currentSelectedItem?.id && sessionStore.currentTopicId) {
+        const historyStore = useChatHistoryStore();
+        const ownerId = sessionStore.currentSelectedItem.id;
+        const ownerType = sessionStore.currentSelectedItem.type || 'agent';
+        const topicId = sessionStore.currentTopicId;
+        console.log(`[Lifecycle] Preloading chat history for ${ownerType} ${ownerId}, topic: ${topicId}`);
+        promises.push(historyStore.preloadHistory(ownerId, ownerType, topicId, 5));
+      }
+
+      await Promise.all(promises);
 
       console.log(`[Lifecycle] [Concurrent] DONE Preloading in ${Date.now() - startTime}ms`);
       updatePhaseLabel('核心数据预加载完成');
@@ -136,6 +165,17 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
       isBootstrapping.value = false;
       bootstrapPromise = null;
       setState('READY', '应用就绪');
+
+      // 话题列表延迟到 READY 后异步加载，不阻塞首屏渲染
+      // 首屏只需 currentTopicId（Pinia persist 已恢复），话题列表仅侧边栏需要
+      if (sessionStore.currentSelectedItem?.id) {
+        const ownerId = sessionStore.currentSelectedItem.id;
+        const ownerType = sessionStore.currentSelectedItem.type || 'agent';
+        console.log(`[Lifecycle] Restored session detected, deferring topic list load for ${ownerType} ${ownerId}...`);
+        topicStore.loadTopicList(ownerId, ownerType).catch(err => {
+          console.error(`[Lifecycle] Deferred topic list load failed:`, err);
+        });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       fail(`预加载失败: ${message}`);
@@ -166,7 +206,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
-      let timeoutId: ReturnType<typeof setTimeout>;
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
       let unwatch: (() => void);
 
       const cleanup = () => {
@@ -187,10 +227,23 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         () => notificationStore.vcpCoreStatus.status,
         (newStatus) => {
           if (settled) return;
+
+          // ⚡ 若进入解压或优化迁移状态，立即取消 15s 的就绪超时定时器，防止大体积数据库迁移被误判为启动超时
+          if (newStatus === 'decompressing' || newStatus === 'optimizing') {
+            if (timeoutId) {
+              clearTimeout(timeoutId);
+              timeoutId = undefined;
+            }
+          }
+
           if (newStatus === 'ready') {
             settled = true;
             cleanup();
             resolve();
+          } else if (newStatus === 'decompression-complete') {
+            settled = true;
+            cleanup();
+            reject(new Error('DATABASE_MIGRATION_COMPLETED'));
           } else if (newStatus === 'error') {
             settled = true;
             cleanup();
@@ -246,10 +299,12 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         errorMsg.value = null;
         hasBootstrapped.value = false;
 
-        setState('PERMISSIONS', '检查系统权限完整性');
         const pStatus = await invoke<{ notification: boolean; storage: boolean; battery: boolean }>('plugin:vcp-mobile|check_all_permissions');
-        if (!pStatus.notification || !pStatus.storage || !pStatus.battery) {
+        const listenerRes = await invoke<{ enabled: boolean }>('plugin:vcp-mobile|check_notification_listener_permission');
+        if (!pStatus.notification || !pStatus.storage || !pStatus.battery || !listenerRes.enabled) {
           console.log('[Lifecycle] Missing permissions, waiting for user action');
+          // 仅在确认缺失权限时才将状态设为 PERMISSIONS，避免权限完整时引导页一闪而过
+          setState('PERMISSIONS', '权限缺失，展示引导界面');
           // 清除 Promise，以便下次点击“进入应用”时能重新触发
           bootstrapPromise = null;
           isBootstrapping.value = false;
@@ -261,19 +316,42 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         // --- 核心优化：先拿快照，再跑流程 ---
         await hydrateSystemStatus();
 
-        updatePhaseLabel('初始化主题资源...');
-        await themeStore.initTheme();
-        console.log('[Lifecycle] Theme initialization complete');
-
+        // --- 并行优化：主题初始化与核心就绪等待无数据依赖，并行执行 ---
         setState('CONNECTING', '等待后端核心服务就绪');
-        await waitForCoreReady();
+        await Promise.all([
+          themeStore.initTheme(),
+          waitForCoreReady()
+        ]);
+        console.log('[Lifecycle] Theme init + core ready complete');
         await startPreloading();
       } catch (error) {
+        if (error instanceof Error && error.message === 'DATABASE_MIGRATION_COMPLETED') {
+          console.log('[Lifecycle] Database migration completed, halting boot for restart.');
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         fail(message);
         throw error;
       }
     })();
+
+    let stopMigrationWatch: (() => void) | null = null;
+    stopMigrationWatch = watch(
+      () => notificationStore.vcpCoreStatus,
+      (coreStatus) => {
+        if (coreStatus.status === 'decompressing' || coreStatus.status === 'optimizing') {
+          state.value = 'MIGRATING';
+          currentPhaseLabel.value = coreStatus.message;
+        } else if (coreStatus.status === 'decompression-complete') {
+          state.value = 'MIGRATED';
+          currentPhaseLabel.value = coreStatus.message;
+          // 迁移最终态已捕获，销毁 watcher，避免多次 bootstrap() 时累积
+          stopMigrationWatch?.();
+          stopMigrationWatch = null;
+        }
+      },
+      { deep: true }
+    );
 
     return bootstrapPromise;
   };
@@ -286,6 +364,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
     isBootstrapping,
     hasBootstrapped,
     lastTransitionAt,
+    isBackground,
     coreStatus: computed(() => notificationStore.vcpCoreStatus),
     bootstrap,
     hydrateSystemStatus

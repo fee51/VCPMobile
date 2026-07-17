@@ -15,7 +15,7 @@ import SettingsRow from "../../components/settings/SettingsRow.vue";
 import AboutSection from "./components/AboutSection.vue"; // 实测解析延迟明显，保持静态
 
 // 低频子页面（advanced / power）：懒加载，用户点进子页面时才解析
-const AssistantSettingsSection = defineAsyncComponent(() => import("./components/AssistantSettingsSection.vue"));
+// const AssistantSettingsSection = defineAsyncComponent(() => import("./components/AssistantSettingsSection.vue"));
 const TopicSummarySection = defineAsyncComponent(() => import("./components/TopicSummarySection.vue"));
 const DistributedSettingsSection = defineAsyncComponent(() => import("../distributed/DistributedSettingsSection.vue"));
 const MaintenanceSection = defineAsyncComponent(() => import("./components/MaintenanceSection.vue"));
@@ -56,8 +56,9 @@ const settings = ref<AppSettings>({
   fileKey: "",
   agentOrder: [],
   groupOrder: [],
-  topicSummaryModel: "gemini-2.5-flash",
+  topicSummaryModel: "gemini-3.1-flash-lite",
   syncLogLevel: "INFO",
+  // [SUSPENDED BETA] 浮动助手（划词悬浮球）功能当前已暂停使用，默认值保留供后续重启
   enableAssistant: false,
   assistantAgentId: "",
 });
@@ -243,9 +244,9 @@ watch(currentSubPage, (val) => {
             class="absolute inset-0 flex flex-col z-10 transition-colors duration-300 bg-[var(--primary-bg)]"
           >
 
-            <div 
-              class="flex-1 pb-safe"
-              :class="currentSubPage === 'about' ? 'overflow-hidden flex flex-col' : 'overflow-y-auto px-3 pt-6 pb-5 space-y-6 no-rubber-band'"
+            <div
+              class="flex-1"
+              :class="currentSubPage === 'about' ? 'overflow-hidden flex flex-col pb-[calc(var(--vcp-safe-bottom,48px))]' : 'overflow-y-auto px-3 pt-6 space-y-6 no-rubber-band pb-[calc(var(--vcp-safe-bottom,48px))]'"
             >
               <!-- 用户身份 -->
               <template v-if="visibleSubPage === 'identity'">
@@ -288,12 +289,15 @@ watch(currentSubPage, (val) => {
               <!-- 高级功能 -->
               <template v-if="visibleSubPage === 'advanced'">
                 <div class="space-y-6">
+                  <!-- [SUSPENDED BETA] 划词悬浮助手功能当前已暂停使用，相关组件与设置代码保留，入口已关闭 -->
+                  <!--
                   <div>
                     <h3 class="text-[11px] font-black uppercase tracking-[0.15em] opacity-50 mb-3 px-1">划词悬浮助手</h3>
                     <SettingsCard>
                       <AssistantSettingsSection :settings="settings" @save-request="saveSettings" />
                     </SettingsCard>
                   </div>
+                  -->
                   <div>
                     <h3 class="text-[11px] font-black uppercase tracking-[0.15em] opacity-50 mb-3 px-1">话题总结</h3>
                     <SettingsCard>

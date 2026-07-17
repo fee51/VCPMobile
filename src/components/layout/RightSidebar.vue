@@ -161,7 +161,7 @@ watch(
     <NotificationList :items="store.historyList" />
 
     <!-- 底部：工具按钮 2x2 网格区 -->
-    <div class="p-4 border-t border-black/5 dark:border-white/5 glass-panel shrink-0 pb-[calc(var(--vcp-safe-bottom,16px)+8px)]">
+    <div class="p-4 border-t border-black/5 dark:border-white/5 glass-panel shrink-0 pb-[calc(var(--vcp-safe-bottom,48px)+8px)]">
       <div class="grid grid-cols-2 gap-2">
         <button
           class="col-span-1 py-3 px-4 rounded-full transition-all text-white flex items-center justify-center gap-2 hover:opacity-90 active:scale-95 shadow-md border border-black/5 dark:border-white/5"
@@ -202,6 +202,7 @@ watch(
   bottom: 0;
   width: 82vw;
   max-width: 340px;
+  background-color: var(--secondary-bg);
   background-color: color-mix(in srgb, var(--secondary-bg) 97%, transparent);
   transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
   z-index: var(--layer-drawer);

@@ -1,8 +1,11 @@
 <script setup lang="ts">
-import { ref, onMounted, watch, onUnmounted } from "vue";
+// [SUSPENDED BETA] 划词悬浮助手设置面板当前已暂停使用，SettingsView.vue 中的入口已注释关闭。
+// 保留组件代码供后续重启该功能时恢复。
+import { ref, onMounted, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore, type AppSettings } from "../../../core/stores/settings";
 import { useAssistantStore } from "../../../core/stores/assistant";
+import { useAppLifecycleStore } from "../../../core/stores/appLifecycle";
 import SettingsSwitch from "../../../components/settings/SettingsSwitch.vue";
 import SettingsRow from "../../../components/settings/SettingsRow.vue";
 
@@ -73,8 +76,10 @@ watch(
   }
 );
 
-const handleLifecycleEvent = async (e: any) => {
-  if (e.detail?.state === "resume") {
+const lifecycleStore = useAppLifecycleStore();
+
+watch(() => lifecycleStore.isBackground, async (newVal) => {
+  if (!newVal) {
     await checkPermission();
     if (props.settings.enableAssistant && hasOverlayPermission.value) {
       try {
@@ -86,7 +91,7 @@ const handleLifecycleEvent = async (e: any) => {
       } catch (_) {}
     }
   }
-};
+});
 
 onMounted(async () => {
   await checkPermission();
@@ -101,14 +106,6 @@ onMounted(async () => {
       await invoke("reconcile_local_server_cmd", { enable: true });
     } catch (_) {}
   }
-
-  // 监听生命周期 resume 事件以刷新权限状态
-  window.addEventListener("vcp-lifecycle", handleLifecycleEvent);
-});
-
-onUnmounted(() => {
-  // 组件解卸时必须销毁全局监听器，以防内存泄露和重复挂载
-  window.removeEventListener("vcp-lifecycle", handleLifecycleEvent);
 });
 </script>
 

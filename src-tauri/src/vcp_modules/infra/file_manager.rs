@@ -42,6 +42,16 @@ pub fn get_thumbnails_root_dir<R: tauri::Runtime>(
     Ok(path)
 }
 
+/// 核心路径解析：获取多模态抽取/转码持久化缓存目录
+/// Android: /storage/emulated/0/Android/data/<pkg>/files/multimodal_cache
+pub fn get_multimodal_cache_dir<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+) -> Result<std::path::PathBuf, String> {
+    let mut path = get_data_root_dir(app_handle)?;
+    path.push("multimodal_cache");
+    Ok(path)
+}
+
 /// 物理安全的文件重命名工具，能够跨越物理挂载分区 (EXDEV) 降级进行物理拷贝+删除
 pub fn safe_rename<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
     from: P,
@@ -239,10 +249,15 @@ fn ensure_safe_path(app_handle: &AppHandle, path: &std::path::Path) -> Result<()
     let thumbnails_dir = get_thumbnails_root_dir(app_handle)?;
     let canonical_thumbnails = std::fs::canonicalize(&thumbnails_dir).unwrap_or(thumbnails_dir);
 
+    let multimodal_cache_dir = get_multimodal_cache_dir(app_handle)?;
+    let canonical_multimodal_cache =
+        std::fs::canonicalize(&multimodal_cache_dir).unwrap_or(multimodal_cache_dir);
+
     if canonical_path.starts_with(&canonical_config)
         || canonical_path.starts_with(&canonical_cache)
         || canonical_path.starts_with(&canonical_attachments)
         || canonical_path.starts_with(&canonical_thumbnails)
+        || canonical_path.starts_with(&canonical_multimodal_cache)
     {
         Ok(())
     } else {
@@ -316,8 +331,12 @@ pub async fn register_attachment_internal<R: tauri::Runtime>(
 
     let internal_file_path = std::path::PathBuf::from(&internal_path);
 
-    // 2. 提取文本内容 (如果适用)
-    let extracted_text = try_extract_text(&internal_file_path, &mime_type);
+    // 2. 提取文本内容 (如果适用，使用 spawn_blocking 隔离 CPU 密集型操作以防阻塞 Tokio 异步线程)
+    let path_c = internal_file_path.clone();
+    let mime_c = mime_type.clone();
+    let extracted_text = tokio::task::spawn_blocking(move || try_extract_text(&path_c, &mime_c))
+        .await
+        .map_err(|e| format!("Text extraction panicked: {}", e))?;
 
     // 3. 生成缩略图 (如果适用，spawn_blocking 隔离 CPU 密集型操作)
     let thumbnail_path = if mime_type.starts_with("image/") {
@@ -767,7 +786,88 @@ pub fn clear_upload_cache(app_handle: &AppHandle) {
                 }
             }
         }
+
+        // 3. 自动收敛多模态结果缓存 (300MB 阈值，收敛至 150MB)
+        evict_multimodal_cache_if_needed(app_handle, 300 * 1024 * 1024, 150 * 1024 * 1024);
     }
+}
+
+/// 限制并收敛多模态结果缓存目录的总大小 (LRU 思想，基于 mtime 淘汰最旧的 json 缓存)
+/// 当总大小超过 max_size_bytes (e.g. 300MB) 时，自动淘汰最旧的缓存，直到大小收缩到 target_size_bytes (e.g. 150MB)
+pub fn evict_multimodal_cache_if_needed<R: tauri::Runtime>(
+    app_handle: &tauri::AppHandle<R>,
+    max_size_bytes: u64,
+    target_size_bytes: u64,
+) {
+    let cache_dir = match get_multimodal_cache_dir(app_handle) {
+        Ok(dir) => dir,
+        Err(_) => return,
+    };
+
+    if !cache_dir.exists() || !cache_dir.is_dir() {
+        return;
+    }
+
+    let entries = match fs::read_dir(&cache_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    struct CacheFile {
+        path: std::path::PathBuf,
+        size: u64,
+        mtime: std::time::SystemTime,
+    }
+
+    let mut cache_files = Vec::new();
+    let mut total_size = 0u64;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Ok(meta) = fs::metadata(&path) {
+                let size = meta.len();
+                let mtime = meta
+                    .modified()
+                    .unwrap_or_else(|_| std::time::SystemTime::now());
+                total_size += size;
+                cache_files.push(CacheFile { path, size, mtime });
+            }
+        }
+    }
+
+    if total_size <= max_size_bytes {
+        return;
+    }
+
+    log::info!(
+        "[FileManager] Multimodal cache size ({} MB) exceeds limit ({} MB). Starting eviction...",
+        total_size / 1024 / 1024,
+        max_size_bytes / 1024 / 1024
+    );
+
+    // 按照修改时间升序排列 (最旧的在前面)
+    cache_files.sort_by_key(|f| f.mtime);
+
+    let mut evicted_count = 0;
+    let mut evicted_size = 0u64;
+
+    for file in cache_files {
+        if total_size - evicted_size <= target_size_bytes {
+            break;
+        }
+        if fs::remove_file(&file.path).is_ok() {
+            evicted_size += file.size;
+            evicted_count += 1;
+        }
+    }
+
+    log::info!(
+        "[FileManager] Multimodal cache eviction complete. Evicted {} files, freed {:.2} MB. Current size: {:.2} MB.",
+        evicted_count,
+        evicted_size as f64 / 1024.0 / 1024.0,
+        (total_size - evicted_size) as f64 / 1024.0 / 1024.0
+    );
 }
 
 /// ⚡ 确保附件大文本已被安全提取。
@@ -805,8 +905,17 @@ pub async fn ensure_extracted_text(
         hash
     );
 
-    // 2. 调起提取器进行自愈提取
-    if let Some(text) = super::file_extractor::try_extract_text(path, mime_type) {
+    // 2. 调起提取器进行自愈提取 (使用 spawn_blocking 隔离 CPU 密集型操作以防阻塞 Tokio 异步线程)
+    let path_c = path.to_path_buf();
+    let mime_c = mime_type.to_string();
+    let text_opt = tokio::task::spawn_blocking(move || {
+        super::file_extractor::try_extract_text(&path_c, &mime_c)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    if let Some(text) = text_opt {
         let pool_c = pool.clone();
         let hash_c = hash.to_string();
         let text_c = text.clone();
@@ -852,5 +961,32 @@ pub async fn delete_attachment_physical<R: tauri::Runtime>(
     if thumb_path.exists() {
         let _ = tokio::fs::remove_file(thumb_path).await;
     }
+
+    // 统一处理多模态持久化缓存删除
+    if let Ok(cache_dir) = get_multimodal_cache_dir(app_handle) {
+        let cache_path = cache_dir.join(format!("{}.json", hash));
+        if cache_path.exists() {
+            let _ = tokio::fs::remove_file(cache_path).await;
+        }
+    }
     Ok(())
+}
+
+/// 统一校验附件格式支持情况 (合并多模态媒体白名单与文本提取文档白名单)
+#[tauri::command]
+pub fn check_attachment_support(original_name: String) -> Result<bool, String> {
+    let ext = std::path::Path::new(&original_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if crate::vcp_modules::infra::file_extractor::is_supported_attachment_extension(&ext) {
+        Ok(true)
+    } else {
+        Err(format!(
+            "系统不支持 .{} 格式附件。\n大媒体（图片/视频/音频）支持直读多模态；文档（pdf/docx/xlsx/pptx）及常见代码和文本支持内容提取注入上下文。",
+            ext
+        ))
+    }
 }

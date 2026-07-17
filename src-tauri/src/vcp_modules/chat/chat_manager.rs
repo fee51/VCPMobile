@@ -61,7 +61,7 @@ pub struct ChatMessage {
     #[serde(rename = "finishReason", skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<Attachment>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,6 +104,7 @@ pub async fn load_chat_history_streamed(
         false, // include_extracted_text: 前端列表加载不需要大体积的提取文本内容
     )
     .await?;
+
     let total = messages.len();
     for (index, message) in messages.into_iter().enumerate() {
         let is_last = index == total.saturating_sub(1);
@@ -133,7 +134,7 @@ pub async fn load_chat_history(
         limit,
         offset,
         false,
-        false, // include_extracted_text: 前端历史加载不需要大体积的提取文本内容
+        false,
     )
     .await
 }

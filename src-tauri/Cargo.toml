@@ -1,6 +1,6 @@
 [package]
 name = "vcp-mobile"
-version = "1.0.7"
+version = "1.1.3"
 description = "A Tauri App"
 authors = ["MRiecy"]
 edition = "2021"
@@ -50,7 +50,7 @@ lazy_static = "1.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
 log = { version = "0.4", features = ["release_max_level_info"] }
-sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 sha2 = "0.10"
 hex = "0.4"
@@ -70,6 +70,7 @@ percent-encoding = "2"
 urlencoding = "2"
 pulldown-cmark = { version = "0.13.3", default-features = false }
 syntect = { version = "5.3.0", default-features = false, features = ["html", "parsing", "regex-fancy", "default-syntaxes", "default-themes"] }
+rustc-hash = "1.1.0"
 memmap2 = "0.9"
 zstd = "0.13"
 encoding_rs = "0.8"
@@ -80,6 +81,14 @@ tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ast_tail_bench"
+harness = false
 
 [profile.release]
 opt-level = 3   # 最高级别的代码优化
@@ -92,4 +101,14 @@ strip = true    # 移除符号信息，显著减小安装包大小
 opt-level = 1   # 基础代码优化，保持极速编译的同时大幅缩减体积
 debug = 0       # 彻底关闭开发模式下海量臃肿的调试符号（体积暴降的关键！）
 strip = true    # 强行剥离动态库的辅助冗余符号
+
+# 性能基准专用 profile：继承 release 的优化等级，但保留 panic=unwind 以便
+# cargo test --profile perf 能正常链接测试 harness（release 的 panic=abort 无法运行测试）。
+# 仅用于本地基准测量（如 ast_diff 的 tail 处理开销基准），不参与发布构建。
+[profile.perf]
+inherits = "release"
+panic = "unwind"
+strip = false
+lto = "thin"        # full LTO 编译过慢；thin 已足够逼近发布版热路径性能
+codegen-units = 16
 

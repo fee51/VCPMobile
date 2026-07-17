@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, watch, ref, nextTick } from "vue";
+import { computed, watch, ref, nextTick, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
 import { useVirtualList } from "@vueuse/core";
 import { useTopicStore, type Topic } from "../../core/stores/topicListManager";
@@ -174,7 +174,6 @@ watch(
 const selectTopic = async (
   itemId: string,
   topicId: string,
-  topicName: string,
 ) => {
   if (router.currentRoute.value.path !== "/chat") {
     await router.push("/chat");
@@ -182,16 +181,28 @@ const selectTopic = async (
 
   await sessionStore.selectTopicById(itemId, topicId);
 
-  // 顶部栏显示话题标题
-  if (sessionStore.currentSelectedItem) {
-    sessionStore.currentSelectedItem.name = topicName;
-  }
-
   // 在移动端，选择话题后自动关闭侧边栏
   layoutStore.setLeftDrawer(false);
 
   emit("select-topic");
 };
+
+// 话题搜索逻辑集成
+const props = defineProps<{
+  searchQuery?: string;
+}>();
+
+watch(
+  () => props.searchQuery,
+  (newVal) => {
+    topicListStore.searchTerm = newVal || "";
+  },
+  { immediate: true }
+);
+
+onUnmounted(() => {
+  topicListStore.searchTerm = "";
+});
 </script>
 
 <template>
@@ -209,7 +220,6 @@ const selectTopic = async (
         selectTopic(
           item.data.ownerId || sessionStore.currentSelectedItem?.id || 'default_agent',
           item.data.id,
-          item.data.name,
         )
         " v-longpress="() => showTopicContextMenu(item.data.id)">
         <div class="relative p-3 glass-panel rounded-xl flex items-center gap-3 border shadow-sm cursor-pointer transition-[background-color,border-color,transform,box-shadow] duration-300 z-10 w-full active:scale-[0.98] origin-center"

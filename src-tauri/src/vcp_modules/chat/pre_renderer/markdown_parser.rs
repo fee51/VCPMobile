@@ -3,16 +3,17 @@ use crate::vcp_modules::pre_renderer::markdown_ast::{InlineNode, MarkdownNode};
 use lazy_static::lazy_static;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use regex::Regex;
+use std::borrow::Cow;
 
 lazy_static! {
     static ref FENCE_RE: Regex =
-        Regex::new(r"(?m)^[ \t]*```[a-zA-Z0-9-]*[ \t]*\r?$").unwrap();
+        Regex::new(r"(?m)^[ \t]*(`{3,})[a-zA-Z0-9-]*[ \t]*\r?$").unwrap();
 
     // 合并 LaTeX 匹配：[ ... ] 和 ( ... )
     static ref MATH_RE: Regex = Regex::new(r"(?s)\\\[(?P<display>.*?)\\\]|\\\((?P<inline>.*?)\\\)").unwrap();
 
     static ref MAGIC_RE: Regex =
-        Regex::new(r##"(?s)(["“”](?:[^"“”]|\\.)+?["“”])|(@![^\s@!]+)|(@[^\s@]+)"##).unwrap();
+        Regex::new(r##"(@![^\s@!]+)|(@[^\s@]+)"##).unwrap();
 
     static ref HTML_CONTAINER_PLACEHOLDER_RE: Regex =
         Regex::new(r"<!--VCP_HTML_CONTAINER:(\d+)-->").unwrap();
@@ -20,37 +21,432 @@ lazy_static! {
     static ref TAG_SCANNER: Regex = Regex::new(r"(?i)(</?)([a-z0-9\-]+)(\s[^>]*)?>").unwrap();
 
     static ref INLINE_CODE_RE: Regex = Regex::new(r"(?m)`+[^`\n\r]+`+").unwrap();
+
+    static ref COMMENT_RE: Regex = Regex::new(r"(?s)<!--[\s\S]*?(?:-->|$)").unwrap();
+
+    // 匹配行首 ≥4 空格/Tab 缩进后紧跟 $$ 的模式（块级公式被误判为缩进代码块的根因）
+    static ref INDENTED_DOLLAR_RE: Regex =
+        Regex::new(r"(?m)^[ \t]{4,}(\$\$)").unwrap();
 }
 
-fn preprocess_latex_math(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut last_end = 0;
-    let mut in_fence = false;
+fn is_punctuation(c: char) -> bool {
+    c.is_ascii_punctuation()
+        || ('\u{2000}'..='\u{206F}').contains(&c)
+        || ('\u{3000}'..='\u{303F}').contains(&c)
+        || ('\u{FE30}'..='\u{FE4F}').contains(&c)
+        || ('\u{FE10}'..='\u{FE1F}').contains(&c)
+        || ('\u{FF01}'..='\u{FF0F}').contains(&c)
+        || ('\u{FF1A}'..='\u{FF20}').contains(&c)
+        || ('\u{FF3B}'..='\u{FF40}').contains(&c)
+        || ('\u{FF5B}'..='\u{FF60}').contains(&c)
+        || ('\u{FFE0}'..='\u{FFE6}').contains(&c)
+        || c == '\u{00B7}'
+}
 
-    // 1. 扫描代码围栏
-    for m in FENCE_RE.find_iter(text) {
-        let segment = &text[last_end..m.start()];
-        if !in_fence {
-            // 在围栏外：执行极速公式替换
-            push_math_replaced(&mut result, segment);
-        } else {
-            // 在围栏内：直接追加
-            result.push_str(segment);
+fn get_fence_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut current_start: Option<(usize, usize)> = None;
+
+    for cap in FENCE_RE.captures_iter(text) {
+        let m = cap.get(0).unwrap();
+        let backticks = cap.get(1).unwrap().as_str().len();
+
+        match current_start {
+            None => {
+                current_start = Some((m.start(), backticks));
+            }
+            Some((start_pos, start_backticks)) => {
+                if backticks >= start_backticks {
+                    ranges.push(start_pos..m.end());
+                    current_start = None;
+                }
+            }
         }
-        result.push_str(m.as_str());
-        last_end = m.end();
-        in_fence = !in_fence;
     }
 
-    // 2. 处理尾部
-    let tail = &text[last_end..];
-    if !in_fence {
-        push_math_replaced(&mut result, tail);
-    } else {
-        result.push_str(tail);
+    if let Some((start_pos, _)) = current_start {
+        ranges.push(start_pos..text.len());
     }
+
+    ranges
+}
+
+fn apply_flanking_fix(segment: &str) -> String {
+    let mut result = String::with_capacity(segment.len() + 8);
+    let chars: Vec<char> = segment.chars().collect();
+    let len = chars.len();
+
+    let mut in_strong = false;
+    let mut in_emphasis = false;
+    let mut inline_code_backticks = 0; // 0 means not in inline code
+
+    let mut i = 0;
+    while i < len {
+        // 1. 换行符重置（支持多种换行符，防跨行状态泄露）
+        if chars[i] == '\n' || chars[i] == '\r' || chars[i] == '\u{2028}' || chars[i] == '\u{2029}'
+        {
+            in_strong = false;
+            in_emphasis = false;
+            inline_code_backticks = 0;
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        // 2. 连续反引号匹配（精准识别行内代码边界）
+        if chars[i] == '`' {
+            let mut count = 0;
+            while i + count < len && chars[i + count] == '`' {
+                count += 1;
+            }
+            if inline_code_backticks == 0 {
+                // 开启行内代码
+                inline_code_backticks = count;
+                for _ in 0..count {
+                    result.push('`');
+                }
+                i += count;
+                continue;
+            } else if count == inline_code_backticks {
+                // 闭合行内代码
+                inline_code_backticks = 0;
+                for _ in 0..count {
+                    result.push('`');
+                }
+                i += count;
+                continue;
+            } else {
+                // 数量不匹配，视为普通代码内容
+                for _ in 0..count {
+                    result.push('`');
+                }
+                i += count;
+                continue;
+            }
+        }
+
+        if inline_code_backticks > 0 {
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        if chars[i] == '\\' && i + 1 < len {
+            result.push('\\');
+            result.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+
+        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
+            let has_prev = i > 0;
+            let has_next = i + 2 < len;
+            let prev_char = if has_prev { Some(chars[i - 1]) } else { None };
+            let next_char = if has_next { Some(chars[i + 2]) } else { None };
+
+            let is_left_flanking = {
+                if !has_next {
+                    false
+                } else {
+                    let next = next_char.unwrap();
+                    let is_next_whitespace = next == ' '
+                        || next == '\t'
+                        || next == '\n'
+                        || next == '\r'
+                        || next == '\u{2028}'
+                        || next == '\u{2029}';
+                    if is_next_whitespace {
+                        false
+                    } else {
+                        let is_next_punctuation = is_punctuation(next);
+                        if !is_next_punctuation {
+                            true
+                        } else {
+                            !has_prev || {
+                                let prev = prev_char.unwrap();
+                                prev == ' '
+                                    || prev == '\t'
+                                    || prev == '\n'
+                                    || prev == '\r'
+                                    || prev == '\u{2028}'
+                                    || prev == '\u{2029}'
+                                    || is_punctuation(prev)
+                            }
+                        }
+                    }
+                }
+            };
+
+            let is_right_flanking = {
+                if !has_prev {
+                    false
+                } else {
+                    let prev = prev_char.unwrap();
+                    let is_prev_whitespace = prev == ' '
+                        || prev == '\t'
+                        || prev == '\n'
+                        || prev == '\r'
+                        || prev == '\u{2028}'
+                        || prev == '\u{2029}';
+                    if is_prev_whitespace {
+                        false
+                    } else {
+                        let is_prev_punctuation = is_punctuation(prev);
+                        if !is_prev_punctuation {
+                            true
+                        } else {
+                            !has_next || {
+                                let next = next_char.unwrap();
+                                next == ' '
+                                    || next == '\t'
+                                    || next == '\n'
+                                    || next == '\r'
+                                    || next == '\u{2028}'
+                                    || next == '\u{2029}'
+                                    || is_punctuation(next)
+                            }
+                        }
+                    }
+                }
+            };
+
+            let is_left_fix = if let (Some(p), Some(n)) = (prev_char, next_char) {
+                p.is_alphanumeric() && is_punctuation(n)
+            } else {
+                false
+            };
+            let is_left = is_left_flanking || is_left_fix;
+
+            let is_right_fix = if let Some(p) = prev_char {
+                is_punctuation(p)
+            } else {
+                false
+            };
+            let is_right = is_right_flanking || is_right_fix;
+
+            if !in_strong && is_left {
+                if is_left_fix {
+                    result.push_str("**\u{200B}");
+                } else {
+                    result.push_str("**");
+                }
+                in_strong = true;
+            } else if in_strong && is_right {
+                if is_right_fix {
+                    result.push_str("\u{200B}**");
+                } else {
+                    result.push_str("**");
+                }
+                in_strong = false;
+            } else {
+                result.push_str("**");
+            }
+            i += 2;
+            continue;
+        }
+
+        if chars[i] == '*' {
+            let has_prev = i > 0;
+            let has_next = i + 1 < len;
+            let prev_char = if has_prev { Some(chars[i - 1]) } else { None };
+            let next_char = if has_next { Some(chars[i + 1]) } else { None };
+
+            // 识别列表项标志：前面是行首或空格，后面是空格
+            let is_list_item_marker = {
+                let mut prev_is_indent = true;
+                if has_prev {
+                    let mut temp_idx = i;
+                    while temp_idx > 0 {
+                        temp_idx -= 1;
+                        let c = chars[temp_idx];
+                        if c == '\n' || c == '\r' || c == '\u{2028}' || c == '\u{2029}' {
+                            break;
+                        }
+                        if c != ' ' && c != '\t' {
+                            prev_is_indent = false;
+                            break;
+                        }
+                    }
+                }
+                prev_is_indent && next_char == Some(' ')
+            };
+
+            if is_list_item_marker {
+                result.push('*');
+                i += 1;
+                continue;
+            }
+
+            let is_left_flanking = {
+                if !has_next {
+                    false
+                } else {
+                    let next = next_char.unwrap();
+                    let is_next_whitespace = next == ' '
+                        || next == '\t'
+                        || next == '\n'
+                        || next == '\r'
+                        || next == '\u{2028}'
+                        || next == '\u{2029}';
+                    if is_next_whitespace {
+                        false
+                    } else {
+                        let is_next_punctuation = is_punctuation(next);
+                        if !is_next_punctuation {
+                            true
+                        } else {
+                            !has_prev || {
+                                let prev = prev_char.unwrap();
+                                prev == ' '
+                                    || prev == '\t'
+                                    || prev == '\n'
+                                    || prev == '\r'
+                                    || prev == '\u{2028}'
+                                    || prev == '\u{2029}'
+                                    || is_punctuation(prev)
+                            }
+                        }
+                    }
+                }
+            };
+
+            let is_right_flanking = {
+                if !has_prev {
+                    false
+                } else {
+                    let prev = prev_char.unwrap();
+                    let is_prev_whitespace = prev == ' '
+                        || prev == '\t'
+                        || prev == '\n'
+                        || prev == '\r'
+                        || prev == '\u{2028}'
+                        || prev == '\u{2029}';
+                    if is_prev_whitespace {
+                        false
+                    } else {
+                        let is_prev_punctuation = is_punctuation(prev);
+                        if !is_prev_punctuation {
+                            true
+                        } else {
+                            !has_next || {
+                                let next = next_char.unwrap();
+                                next == ' '
+                                    || next == '\t'
+                                    || next == '\n'
+                                    || next == '\r'
+                                    || next == '\u{2028}'
+                                    || next == '\u{2029}'
+                                    || is_punctuation(next)
+                            }
+                        }
+                    }
+                }
+            };
+
+            let is_left_fix = if let (Some(p), Some(n)) = (prev_char, next_char) {
+                p.is_alphanumeric() && is_punctuation(n)
+            } else {
+                false
+            };
+            let is_left = is_left_flanking || is_left_fix;
+
+            let is_right_fix = if let Some(p) = prev_char {
+                is_punctuation(p)
+            } else {
+                false
+            };
+            let is_right = is_right_flanking || is_right_fix;
+
+            if !in_emphasis && is_left {
+                if is_left_fix {
+                    result.push_str("*\u{200B}");
+                } else {
+                    result.push('*');
+                }
+                in_emphasis = true;
+            } else if in_emphasis && is_right {
+                if is_right_fix {
+                    result.push_str("\u{200B}*");
+                } else {
+                    result.push('*');
+                }
+                in_emphasis = false;
+            } else {
+                result.push('*');
+            }
+            i += 1;
+            continue;
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
+}
+
+fn fix_flanking_delimiters(text: &str) -> String {
+    if !text.contains('*') {
+        return text.to_string();
+    }
+
+    let mut result = String::with_capacity(text.len() + 16);
+    let mut last_end = 0;
+    let ranges = get_fence_ranges(text);
+
+    for range in &ranges {
+        let segment = &text[last_end..range.start];
+        result.push_str(&apply_flanking_fix(segment));
+        result.push_str(&text[range.start..range.end]);
+        last_end = range.end;
+    }
+
+    let tail = &text[last_end..];
+    result.push_str(&apply_flanking_fix(tail));
 
     result
+}
+
+fn strip_display_math_indent(text: &str) -> Cow<'_, str> {
+    if !text.contains("$$") {
+        return Cow::Borrowed(text);
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    let ranges = get_fence_ranges(text);
+
+    for range in &ranges {
+        let segment = &text[last_end..range.start];
+        result.push_str(INDENTED_DOLLAR_RE.replace_all(segment, "$1").as_ref());
+        result.push_str(&text[range.start..range.end]);
+        last_end = range.end;
+    }
+
+    let tail = &text[last_end..];
+    result.push_str(INDENTED_DOLLAR_RE.replace_all(tail, "$1").as_ref());
+
+    Cow::Owned(result)
+}
+
+fn preprocess_latex_math(text: &str) -> Cow<'_, str> {
+    if !text.contains("\\[") && !text.contains("\\(") {
+        return Cow::Borrowed(text);
+    }
+
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    let ranges = get_fence_ranges(text);
+
+    for range in &ranges {
+        let segment = &text[last_end..range.start];
+        push_math_replaced(&mut result, segment);
+        result.push_str(&text[range.start..range.end]);
+        last_end = range.end;
+    }
+
+    let tail = &text[last_end..];
+    push_math_replaced(&mut result, tail);
+
+    Cow::Owned(result)
 }
 
 /// 辅助函数：将含有 LaTeX 的片段高效推送到结果缓冲区，不产生中间 String
@@ -79,15 +475,18 @@ fn push_math_replaced(dest: &mut String, segment: &str) {
 }
 
 /// 提取 HTML 容器块，将其替换为占位符，并递归解析内部 Markdown
-fn extract_html_containers(text: &str) -> (String, Vec<(String, Vec<MarkdownNode>, String)>) {
+#[allow(clippy::type_complexity)]
+fn extract_html_containers(text: &str) -> (Cow<'_, str>, Vec<(String, Vec<MarkdownNode>, String)>) {
+    if !text.contains('<') {
+        return (Cow::Borrowed(text), Vec::new());
+    }
+
     let mut result = String::with_capacity(text.len());
     let mut containers: Vec<(String, Vec<MarkdownNode>, String)> = Vec::new();
     let mut last_pos = 0;
 
-    // 预先收集所有代码围栏的位置以供快速查询 (标准 regex find_iter)
-    let fences: Vec<regex::Match> = FENCE_RE.find_iter(text).collect();
-    let mut fence_cursor = 0;
-    let mut in_fence = false;
+    // 预先收集所有代码围栏的物理范围
+    let fences = get_fence_ranges(text);
 
     // 预先收集所有内联反引号的范围以跳过误提取
     let inline_codes: Vec<(usize, usize)> = INLINE_CODE_RE
@@ -111,13 +510,8 @@ fn extract_html_containers(text: &str) -> (String, Vec<(String, Vec<MarkdownNode
             continue;
         }
 
-        // 高效同步围栏状态：跳过当前匹配位置之前的围栏切换
-        while fence_cursor < fences.len() && fences[fence_cursor].start() <= m.start() {
-            in_fence = !in_fence;
-            fence_cursor += 1;
-        }
-
-        if in_fence {
+        // 健壮性防御：如果当前标签处于代码围栏内部，直接跳过
+        if fences.iter().any(|range| range.contains(&m.start())) {
             continue;
         }
 
@@ -140,17 +534,11 @@ fn extract_html_containers(text: &str) -> (String, Vec<(String, Vec<MarkdownNode
             containers.push((open_tag, inner_nodes, close_tag));
 
             last_pos = close_end;
-
-            // 由于 last_pos 跳跃了，同步围栏游标状态
-            while fence_cursor < fences.len() && fences[fence_cursor].start() < last_pos {
-                in_fence = !in_fence;
-                fence_cursor += 1;
-            }
         }
     }
 
     result.push_str(&text[last_pos..]);
-    (result, containers)
+    (Cow::Owned(result), containers)
 }
 
 /// 去除文本中所有非空行的公共前导缩进（空格/制表符）。
@@ -218,6 +606,26 @@ pub(crate) fn trim_common_leading_indent(text: &str) -> String {
     result
 }
 
+fn is_void_html_tag(tag: &str) -> bool {
+    matches!(
+        tag.to_ascii_lowercase().as_str(),
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
 /// 从字符串末尾向前查找匹配的 HTML 闭标签，返回 (close_start, close_end)
 pub(crate) fn find_matching_close_tag(
     text: &str,
@@ -228,14 +636,18 @@ pub(crate) fn find_matching_close_tag(
     let search_area = &text[start_pos..];
 
     // 预先收集 search_area 中所有标准代码围栏的物理范围（支持流式未闭合边界）
-    let mut fence_ranges = Vec::new();
-    let mut fence_iter = FENCE_RE.find_iter(search_area);
-    while let Some(start) = fence_iter.next() {
-        if let Some(end) = fence_iter.next() {
-            fence_ranges.push(start.start()..end.end());
-        } else {
-            fence_ranges.push(start.start()..search_area.len());
-        }
+    let fence_ranges = get_fence_ranges(search_area);
+
+    // 预先收集 search_area 中所有行内代码范围
+    let inline_codes: Vec<(usize, usize)> = INLINE_CODE_RE
+        .find_iter(search_area)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+
+    // 预先收集 search_area 中所有 HTML 注释的物理范围（支持流式未闭合注释边界）
+    let mut comment_ranges = Vec::new();
+    for m in COMMENT_RE.find_iter(search_area) {
+        comment_ranges.push(m.start()..m.end());
     }
 
     for cap in TAG_SCANNER.captures_iter(search_area) {
@@ -255,8 +667,30 @@ pub(crate) fn find_matching_close_tag(
             continue;
         }
 
+        // 健壮性防御：如果当前扫描到的 HTML 标签处于行内代码内部，直接跳过
+        let is_in_inline = inline_codes
+            .iter()
+            .any(|&(start, end)| cap_start >= start && cap_start < end);
+        if is_in_inline {
+            continue;
+        }
+
+        // 健壮性防御：如果当前扫描到的 HTML 标签处于 HTML 注释内部，直接跳过
+        if comment_ranges
+            .iter()
+            .any(|range| range.contains(&cap_start))
+        {
+            continue;
+        }
+
         let is_close_tag = cap.get(1).unwrap().as_str() == "</";
         let tag_name = cap.get(2).unwrap().as_str();
+        let tag_text = full_match.as_str();
+        let is_self_closing = tag_text.trim_end().ends_with("/>");
+
+        if is_void_html_tag(tag_name) || is_self_closing {
+            continue;
+        }
 
         if tag_name.eq_ignore_ascii_case(tag) {
             if is_close_tag {
@@ -303,8 +737,17 @@ fn replace_container_placeholders(
 }
 
 pub fn parse_markdown_to_ast(text: &str) -> Vec<MarkdownNode> {
-    let raw_text = text.to_string();
-    let result = std::panic::catch_unwind(move || parse_markdown_to_ast_impl(&raw_text));
+    parse_markdown_to_ast_opt(text, false)
+}
+
+pub fn parse_markdown_to_ast_streaming(text: &str) -> Vec<MarkdownNode> {
+    parse_markdown_to_ast_opt(text, true)
+}
+
+fn parse_markdown_to_ast_opt(text: &str, is_streaming: bool) -> Vec<MarkdownNode> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse_markdown_to_ast_impl(text, is_streaming)
+    }));
     match result {
         Ok(nodes) => nodes,
         Err(e) => {
@@ -317,33 +760,49 @@ pub fn parse_markdown_to_ast(text: &str) -> Vec<MarkdownNode> {
     }
 }
 
-fn parse_markdown_to_ast_impl(text: &str) -> Vec<MarkdownNode> {
-    let text = preprocess_latex_math(text);
-    let (text, containers) = extract_html_containers(&text);
+fn parse_markdown_to_ast_impl(text: &str, is_streaming: bool) -> Vec<MarkdownNode> {
+    let text_fixed = fix_flanking_delimiters(text);
+    let text = preprocess_latex_math(&text_fixed);
+    let text = strip_display_math_indent(text.as_ref());
+    let (text, containers) = extract_html_containers(text.as_ref());
+
     let mut nodes = Vec::new();
     let parser = Parser::new_ext(
-        &text,
+        text.as_ref(),
         Options::ENABLE_MATH | Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
     );
 
     let mut stack: Vec<PartialNode> = Vec::new();
+    let mut accumulated_text = String::new();
 
-    for event in parser {
-        match event {
-            Event::Start(tag) => {
-                stack.push(PartialNode::from_tag(tag));
-            }
-            Event::Text(text) => {
+    let flush_accumulated_text =
+        |accumulated: &mut String, stack: &mut Vec<PartialNode>, nodes: &mut Vec<MarkdownNode>| {
+            if !accumulated.is_empty() {
                 let inline_nodes = if matches!(stack.last(), Some(PartialNode::CodeBlock { .. })) {
-                    vec![InlineNode::text(text.to_string())]
+                    vec![InlineNode::text(accumulated.clone())]
                 } else {
-                    process_text_magic(&text)
+                    process_text_magic(accumulated)
                 };
                 if let Some(top) = stack.last_mut() {
                     top.push_inlines(inline_nodes);
                 } else {
                     nodes.push(MarkdownNode::paragraph(inline_nodes));
                 }
+                accumulated.clear();
+            }
+        };
+
+    for event in parser {
+        if let Event::Text(text) = event {
+            accumulated_text.push_str(&text);
+            continue;
+        }
+
+        flush_accumulated_text(&mut accumulated_text, &mut stack, &mut nodes);
+
+        match event {
+            Event::Start(tag) => {
+                stack.push(PartialNode::from_tag(tag));
             }
             Event::Code(code) => {
                 if let Some(top) = stack.last_mut() {
@@ -456,7 +915,7 @@ fn parse_markdown_to_ast_impl(text: &str) -> Vec<MarkdownNode> {
                             }
                         }
                         _ => {
-                            let completed = node.finalize(tag_end);
+                            let completed = node.finalize(tag_end, is_streaming);
                             if let Some(parent) = stack.last_mut() {
                                 parent.push_child(completed);
                             } else {
@@ -474,14 +933,9 @@ fn parse_markdown_to_ast_impl(text: &str) -> Vec<MarkdownNode> {
                     top.push_inline(InlineNode::raw_html_inline(html.to_string()));
                 }
             }
-            Event::SoftBreak => {
+            Event::SoftBreak | Event::HardBreak => {
                 if let Some(top) = stack.last_mut() {
-                    top.push_inline(InlineNode::soft_break());
-                }
-            }
-            Event::HardBreak => {
-                if let Some(top) = stack.last_mut() {
-                    top.push_inline(InlineNode::line_break());
+                    top.push_inline(InlineNode::r#break());
                 }
             }
             Event::Rule => {
@@ -491,8 +945,15 @@ fn parse_markdown_to_ast_impl(text: &str) -> Vec<MarkdownNode> {
         }
     }
 
+    flush_accumulated_text(&mut accumulated_text, &mut stack, &mut nodes);
+
     // 后处理：将 HTML 容器占位符替换为实际的开标签 + 解析后的子节点 + 闭标签
     replace_container_placeholders(&mut nodes, &containers);
+
+    // 运行引号 AST 合并逻辑
+    for node in &mut nodes {
+        apply_quote_merging(node);
+    }
 
     // 计算全量 AST 节点的稳定哈希指纹
     for node in &mut nodes {
@@ -740,25 +1201,25 @@ impl PartialNode {
         }
     }
 
-    fn finalize(self, _tag_end: TagEnd) -> MarkdownNode {
+    fn finalize(self, _tag_end: TagEnd, is_streaming: bool) -> MarkdownNode {
         match self {
             PartialNode::Paragraph { children } => MarkdownNode::paragraph(children),
             PartialNode::Heading { level, children } => MarkdownNode::heading(level, children),
             PartialNode::CodeBlock { lang, code } => {
                 let lang_str = lang.as_deref().unwrap_or("plaintext");
-                if lang_str == "mermaid" {
-                    MarkdownNode::mermaid(code)
+                let highlighted = if lang_str == "mermaid" || (is_streaming && code.len() > 4096) {
+                    None
                 } else {
-                    let highlighted = highlight_code_block(&code, lang_str);
-                    let mut node = MarkdownNode::code_block(lang, code);
-                    if let MarkdownNode::CodeBlock {
-                        highlighted_html, ..
-                    } = &mut node
-                    {
-                        *highlighted_html = highlighted;
-                    }
-                    node
+                    highlight_code_block(&code, lang_str)
+                };
+                let mut node = MarkdownNode::code_block(lang, code);
+                if let MarkdownNode::CodeBlock {
+                    highlighted_html, ..
+                } = &mut node
+                {
+                    *highlighted_html = highlighted;
                 }
+                node
             }
             PartialNode::Blockquote { children } => MarkdownNode::blockquote(children),
             PartialNode::List { ordered, items } => MarkdownNode::list(ordered, items),
@@ -813,171 +1274,10 @@ impl PartialNode {
 }
 
 fn process_text_magic(text: &str) -> Vec<InlineNode> {
-    process_vcp_magic(text)
-}
-
-/// 轻量级 inline-only 解析器：只处理标准 Markdown 内联语法（strong/emphasis/strikethrough/code/link/image/math），
-/// 不解析 VCP Magic 引号，避免 process_vcp_magic 的无限递归。
-fn parse_inline_standard(text: &str) -> Vec<InlineNode> {
-    let wrapped = format!("{}\n", text);
-    let parser = Parser::new_ext(
-        &wrapped,
-        Options::ENABLE_MATH | Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
-    );
-
-    let mut nodes = Vec::new();
-    let mut in_paragraph = false;
-    let mut stack: Vec<PartialInlineNode> = Vec::new();
-
-    for event in parser {
-        match event {
-            Event::Start(Tag::Paragraph) => in_paragraph = true,
-            Event::End(TagEnd::Paragraph) => in_paragraph = false,
-            Event::Text(t) if in_paragraph || !stack.is_empty() => {
-                let node = InlineNode::text(t.to_string());
-                push_inline_to_context(&mut stack, &mut nodes, node);
-            }
-            Event::Code(code) => {
-                let node = InlineNode::code(code.to_string());
-                push_inline_to_context(&mut stack, &mut nodes, node);
-            }
-            Event::InlineMath(math) => {
-                let node = InlineNode::inline_math(math.to_string(), false);
-                push_inline_to_context(&mut stack, &mut nodes, node);
-            }
-            Event::DisplayMath(math) => {
-                let node = InlineNode::inline_math(math.to_string(), true);
-                push_inline_to_context(&mut stack, &mut nodes, node);
-            }
-            Event::Start(Tag::Strong) => stack.push(PartialInlineNode::Strong { children: vec![] }),
-            Event::End(TagEnd::Strong) => {
-                if let Some(PartialInlineNode::Strong { children }) = stack.pop() {
-                    let node = InlineNode::strong(children);
-                    push_inline_to_context(&mut stack, &mut nodes, node);
-                }
-            }
-            Event::Start(Tag::Emphasis) => {
-                stack.push(PartialInlineNode::Emphasis { children: vec![] })
-            }
-            Event::End(TagEnd::Emphasis) => {
-                if let Some(PartialInlineNode::Emphasis { children }) = stack.pop() {
-                    let node = InlineNode::emphasis(children);
-                    push_inline_to_context(&mut stack, &mut nodes, node);
-                }
-            }
-            Event::Start(Tag::Strikethrough) => {
-                stack.push(PartialInlineNode::Strikethrough { children: vec![] })
-            }
-            Event::End(TagEnd::Strikethrough) => {
-                if let Some(PartialInlineNode::Strikethrough { children }) = stack.pop() {
-                    let node = InlineNode::strikethrough(children);
-                    push_inline_to_context(&mut stack, &mut nodes, node);
-                }
-            }
-            Event::Start(Tag::Link {
-                dest_url, title, ..
-            }) => {
-                stack.push(PartialInlineNode::Link {
-                    href: dest_url.to_string(),
-                    title: if title.is_empty() {
-                        None
-                    } else {
-                        Some(title.to_string())
-                    },
-                    children: vec![],
-                });
-            }
-            Event::End(TagEnd::Link) => {
-                if let Some(PartialInlineNode::Link {
-                    href,
-                    title,
-                    children,
-                }) = stack.pop()
-                {
-                    let node = InlineNode::link(href, title, children);
-                    push_inline_to_context(&mut stack, &mut nodes, node);
-                }
-            }
-            Event::Start(Tag::Image {
-                dest_url, title, ..
-            }) => {
-                stack.push(PartialInlineNode::Image {
-                    src: dest_url.to_string(),
-                    alt: String::new(),
-                    title: if title.is_empty() {
-                        None
-                    } else {
-                        Some(title.to_string())
-                    },
-                });
-            }
-            Event::End(TagEnd::Image) => {
-                if let Some(PartialInlineNode::Image { src, alt, title }) = stack.pop() {
-                    let node = InlineNode::image(src, alt, title);
-                    push_inline_to_context(&mut stack, &mut nodes, node);
-                }
-            }
-            Event::SoftBreak => {
-                let node = InlineNode::SoftBreak;
-                push_inline_to_context(&mut stack, &mut nodes, node);
-            }
-            Event::HardBreak => {
-                let node = InlineNode::LineBreak;
-                push_inline_to_context(&mut stack, &mut nodes, node);
-            }
-            _ => {}
-        }
+    if !text.contains('@') {
+        return vec![InlineNode::text(text.to_string())];
     }
 
-    nodes
-}
-
-enum PartialInlineNode {
-    Strong {
-        children: Vec<InlineNode>,
-    },
-    Emphasis {
-        children: Vec<InlineNode>,
-    },
-    Strikethrough {
-        children: Vec<InlineNode>,
-    },
-    Link {
-        href: String,
-        title: Option<String>,
-        children: Vec<InlineNode>,
-    },
-    Image {
-        src: String,
-        alt: String,
-        title: Option<String>,
-    },
-}
-
-#[allow(clippy::ptr_arg)]
-fn push_inline_to_context(
-    stack: &mut Vec<PartialInlineNode>,
-    nodes: &mut Vec<InlineNode>,
-    node: InlineNode,
-) {
-    if let Some(top) = stack.last_mut() {
-        match top {
-            PartialInlineNode::Strong { children } => children.push(node),
-            PartialInlineNode::Emphasis { children } => children.push(node),
-            PartialInlineNode::Strikethrough { children } => children.push(node),
-            PartialInlineNode::Link { children, .. } => children.push(node),
-            PartialInlineNode::Image { alt, .. } => {
-                if let InlineNode::Text { value } = &node {
-                    alt.push_str(value);
-                }
-            }
-        }
-    } else {
-        nodes.push(node);
-    }
-}
-
-fn process_vcp_magic(text: &str) -> Vec<InlineNode> {
     let mut nodes = Vec::new();
     let mut last_end = 0;
 
@@ -987,20 +1287,19 @@ fn process_vcp_magic(text: &str) -> Vec<InlineNode> {
             nodes.push(InlineNode::text(text[last_end..m.start()].to_string()));
         }
 
-        if let Some(quote) = cap.get(1) {
-            let quote_text = quote.as_str();
-            let children = if quote_text.is_empty() {
-                vec![]
-            } else {
-                parse_inline_standard(quote_text)
-            };
-            nodes.push(InlineNode::quoted_text(children));
-        } else if let Some(alert) = cap.get(2) {
-            nodes.push(InlineNode::alert_tag(alert.as_str().to_string()));
-        } else if let Some(tag) = cap.get(3) {
-            nodes.push(InlineNode::highlight_tag(tag.as_str().to_string()));
-        }
+        let node = if let Some(alert) = cap.get(1) {
+            InlineNode::vcp_custom("alert".to_string(), Some(alert.as_str().to_string()), None)
+        } else if let Some(tag) = cap.get(2) {
+            InlineNode::vcp_custom(
+                "highlight".to_string(),
+                Some(tag.as_str().to_string()),
+                None,
+            )
+        } else {
+            unreachable!()
+        };
 
+        nodes.push(node);
         last_end = m.end();
     }
 
@@ -1009,4 +1308,499 @@ fn process_vcp_magic(text: &str) -> Vec<InlineNode> {
     }
 
     nodes
+}
+
+fn split_text_by_quotes(inlines: Vec<InlineNode>) -> Vec<InlineNode> {
+    let mut result = Vec::new();
+    for node in inlines {
+        match node {
+            InlineNode::Text { value } => {
+                let mut temp = String::new();
+                let chars: Vec<char> = value.chars().collect();
+                let len = chars.len();
+                let mut j = 0;
+
+                while j < len {
+                    let c = chars[j];
+                    if c == '“' || c == '”' || c == '"' {
+                        if !temp.is_empty() {
+                            result.push(InlineNode::text(temp.clone()));
+                            temp.clear();
+                        }
+                        result.push(InlineNode::text(c.to_string()));
+                    } else {
+                        temp.push(c);
+                    }
+                    j += 1;
+                }
+                if !temp.is_empty() {
+                    result.push(InlineNode::text(temp));
+                }
+            }
+            mut other => {
+                match &mut other {
+                    InlineNode::Strong { children, .. } => {
+                        *children = split_text_by_quotes(children.clone());
+                    }
+                    InlineNode::Emphasis { children, .. } => {
+                        *children = split_text_by_quotes(children.clone());
+                    }
+                    InlineNode::Link { children, .. } => {
+                        *children = split_text_by_quotes(children.clone());
+                    }
+                    InlineNode::Strikethrough { children, .. } => {
+                        *children = split_text_by_quotes(children.clone());
+                    }
+                    InlineNode::VcpCustom {
+                        children: Some(children),
+                        ..
+                    } => {
+                        *children = split_text_by_quotes(children.clone());
+                    }
+                    _ => {}
+                }
+                result.push(other);
+            }
+        }
+    }
+    result
+}
+
+#[allow(clippy::needless_range_loop)]
+fn merge_quote_nodes(inlines: Vec<InlineNode>) -> Vec<InlineNode> {
+    let mut result = Vec::new();
+    let mut i = 0;
+    let len = inlines.len();
+
+    while i < len {
+        let mut start_idx = None;
+        let mut open_char = None;
+
+        if let InlineNode::Text { value } = &inlines[i] {
+            if value.starts_with('“') {
+                start_idx = Some(i);
+                open_char = Some('“');
+            } else if value.starts_with('"') {
+                start_idx = Some(i);
+                open_char = Some('"');
+            }
+        }
+
+        if let (Some(s_idx), Some(op_c)) = (start_idx, open_char) {
+            let cl_c = if op_c == '“' { '”' } else { '"' };
+            let mut end_idx = None;
+            for j in s_idx..len {
+                if let InlineNode::Text { value } = &inlines[j] {
+                    if j == s_idx {
+                        if value.len() >= 2 && value.ends_with(cl_c) {
+                            end_idx = Some(j);
+                            break;
+                        }
+                    } else {
+                        if value.ends_with(cl_c) {
+                            end_idx = Some(j);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(e_idx) = end_idx {
+                let mut children = Vec::new();
+
+                if s_idx == e_idx {
+                    if let InlineNode::Text { value } = &inlines[s_idx] {
+                        let inner_val = &value[op_c.len_utf8()..value.len() - cl_c.len_utf8()];
+                        if !inner_val.is_empty() {
+                            children.push(InlineNode::text(inner_val.to_string()));
+                        }
+                    }
+                } else {
+                    if let InlineNode::Text { value } = &inlines[s_idx] {
+                        let inner_val = &value[op_c.len_utf8()..];
+                        if !inner_val.is_empty() {
+                            children.push(InlineNode::text(inner_val.to_string()));
+                        }
+                    }
+
+                    children.extend(inlines[(s_idx + 1)..e_idx].iter().cloned());
+
+                    if let InlineNode::Text { value } = &inlines[e_idx] {
+                        let inner_val = &value[..value.len() - cl_c.len_utf8()];
+                        if !inner_val.is_empty() {
+                            children.push(InlineNode::text(inner_val.to_string()));
+                        }
+                    }
+                }
+
+                // 递归合并内部子节点（绝对不含外层引号，安全防御无限递归）
+                let merged_children = merge_quote_nodes(children);
+
+                // 将外层引号和已合并的内部子节点组装起来
+                let mut final_children = Vec::new();
+                final_children.push(InlineNode::text(op_c.to_string()));
+                final_children.extend(merged_children);
+                final_children.push(InlineNode::text(cl_c.to_string()));
+
+                result.push(InlineNode::vcp_custom(
+                    "quote".to_string(),
+                    None,
+                    Some(final_children),
+                ));
+                i = e_idx + 1;
+                continue;
+            }
+        }
+
+        let mut node = inlines[i].clone();
+        match &mut node {
+            InlineNode::Strong { children, .. } => {
+                *children = merge_quote_nodes(children.clone());
+            }
+            InlineNode::Emphasis { children, .. } => {
+                *children = merge_quote_nodes(children.clone());
+            }
+            InlineNode::Link { children, .. } => {
+                *children = merge_quote_nodes(children.clone());
+            }
+            InlineNode::Strikethrough { children, .. } => {
+                *children = merge_quote_nodes(children.clone());
+            }
+            InlineNode::VcpCustom {
+                children: Some(children),
+                ..
+            } => {
+                *children = merge_quote_nodes(children.clone());
+            }
+            _ => {}
+        }
+        result.push(node);
+        i += 1;
+    }
+
+    result
+}
+
+fn apply_quote_merging(node: &mut MarkdownNode) {
+    match node {
+        MarkdownNode::Paragraph { children, .. } => {
+            let split = split_text_by_quotes(children.clone());
+            *children = merge_quote_nodes(split);
+        }
+        MarkdownNode::Heading { children, .. } => {
+            let split = split_text_by_quotes(children.clone());
+            *children = merge_quote_nodes(split);
+        }
+        MarkdownNode::Blockquote { children, .. } => {
+            for child in children {
+                apply_quote_merging(child);
+            }
+        }
+        MarkdownNode::List { items, .. } => {
+            for item in items {
+                for child in item {
+                    apply_quote_merging(child);
+                }
+            }
+        }
+        MarkdownNode::Table { header, rows, .. } => {
+            for cell in header {
+                let split = split_text_by_quotes(cell.clone());
+                *cell = merge_quote_nodes(split);
+            }
+            for row in rows {
+                for cell in row {
+                    let split = split_text_by_quotes(cell.clone());
+                    *cell = merge_quote_nodes(split);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_punctuation() {
+        assert!(is_punctuation('“'));
+        assert!(is_punctuation('”'));
+        assert!(is_punctuation('，'));
+        assert!(is_punctuation('。'));
+        assert!(is_punctuation('【'));
+        assert!(is_punctuation('·'));
+    }
+
+    #[test]
+    fn test_fix_flanking_delimiters() {
+        // 1. “**加粗**” 本身能完美闭合，不应该注入任何字符
+        assert_eq!(fix_flanking_delimiters("“**加粗**”"), "“**加粗**”");
+
+        // 2. 这很**“重要”**的 -> 应该在开启后注入，闭合前注入
+        assert_eq!(
+            fix_flanking_delimiters("这很**“重要”**的"),
+            "这很**\u{200B}“重要”\u{200B}**的"
+        );
+
+        // 3. 代码块内部的加粗不应该被处理
+        let code_text = "```\n这很**“重要”**的\n```";
+        assert_eq!(fix_flanking_delimiters(code_text), code_text);
+
+        // 4. 并排复杂的加粗引号：看哪些**“应该加粗的部分没有加粗”**，或者**“不该加粗的部分泄漏了”**
+        assert_eq!(
+            fix_flanking_delimiters("看哪些**“应该加粗的部分没有加粗”**，或者**“不该加粗的部分泄漏了”**"),
+            "看哪些**\u{200B}“应该加粗的部分没有加粗”\u{200B}**，或者**\u{200B}“不该加粗的部分泄漏了”\u{200B}**"
+        );
+    }
+
+    #[test]
+    fn test_quote_merging() {
+        // 1. 简单引号合并
+        let nodes = parse_markdown_to_ast("“你好”");
+        assert_eq!(nodes.len(), 1);
+        if let MarkdownNode::Paragraph { children, .. } = &nodes[0] {
+            assert_eq!(children.len(), 1);
+            if let InlineNode::VcpCustom {
+                kind,
+                children: Some(ch),
+                ..
+            } = &children[0]
+            {
+                assert_eq!(kind, "quote");
+                assert_eq!(ch.len(), 3);
+                assert_eq!(ch[0], InlineNode::text("“".to_string()));
+                assert_eq!(ch[1], InlineNode::text("你好".to_string()));
+                assert_eq!(ch[2], InlineNode::text("”".to_string()));
+            } else {
+                panic!("Expected VcpCustom quote node");
+            }
+        } else {
+            panic!("Expected Paragraph");
+        }
+
+        // 2. 引号与加粗嵌套合并： “你**必须**现在走！”
+        let nodes = parse_markdown_to_ast("“你**必须**现在走！”");
+        assert_eq!(nodes.len(), 1);
+        if let MarkdownNode::Paragraph { children, .. } = &nodes[0] {
+            assert_eq!(children.len(), 1);
+            if let InlineNode::VcpCustom {
+                kind,
+                children: Some(ch),
+                ..
+            } = &children[0]
+            {
+                assert_eq!(kind, "quote");
+                assert_eq!(ch.len(), 5);
+                assert_eq!(ch[0], InlineNode::text("“".to_string()));
+                assert_eq!(ch[1], InlineNode::text("你".to_string()));
+                assert!(matches!(ch[2], InlineNode::Strong { .. }));
+                assert_eq!(ch[3], InlineNode::text("现在走！".to_string()));
+                assert_eq!(ch[4], InlineNode::text("”".to_string()));
+            } else {
+                panic!("Expected VcpCustom quote node");
+            }
+        } else {
+            panic!("Expected Paragraph");
+        }
+    }
+
+    #[test]
+    fn test_complex_bold_quote_parsing() {
+        // 1. 测试单加粗块内包裹两对引号
+        let text_single_bold = "看哪些**“应该加粗的部分没有加粗”，或者“不该加粗的部分泄漏了”**";
+        let nodes_single_bold = parse_markdown_to_ast(text_single_bold);
+        assert_eq!(nodes_single_bold.len(), 1);
+        if let MarkdownNode::Paragraph { children, .. } = &nodes_single_bold[0] {
+            assert_eq!(children.len(), 2);
+            assert_eq!(children[0], InlineNode::text("看哪些".to_string()));
+            if let InlineNode::Strong {
+                children: strong_children,
+                ..
+            } = &children[1]
+            {
+                // \u{200b}, VcpCustom("quote"), Text("，或者"), VcpCustom("quote"), \u{200b}
+                assert_eq!(strong_children.len(), 5);
+                assert_eq!(strong_children[0], InlineNode::text("\u{200b}".to_string()));
+                assert_eq!(strong_children[4], InlineNode::text("\u{200b}".to_string()));
+
+                if let InlineNode::VcpCustom {
+                    kind,
+                    children: Some(q_ch),
+                    ..
+                } = &strong_children[1]
+                {
+                    assert_eq!(kind, "quote");
+                    assert_eq!(q_ch[0], InlineNode::text("“".to_string()));
+                    assert_eq!(
+                        q_ch[1],
+                        InlineNode::text("应该加粗的部分没有加粗".to_string())
+                    );
+                    assert_eq!(q_ch[2], InlineNode::text("”".to_string()));
+                }
+
+                assert_eq!(strong_children[2], InlineNode::text("，或者".to_string()));
+
+                if let InlineNode::VcpCustom {
+                    kind,
+                    children: Some(q_ch),
+                    ..
+                } = &strong_children[3]
+                {
+                    assert_eq!(kind, "quote");
+                    assert_eq!(q_ch[0], InlineNode::text("“".to_string()));
+                    assert_eq!(
+                        q_ch[1],
+                        InlineNode::text("不该加粗的部分泄漏了".to_string())
+                    );
+                    assert_eq!(q_ch[2], InlineNode::text("”".to_string()));
+                }
+            } else {
+                panic!("Expected Strong");
+            }
+        }
+
+        // 2. 测试长文本行隔离及多层复杂嵌套
+        let text1 = "主人，如果真的是由于“跨容器截断”导致的 DOM 崩溃，我们在前端解析器的 `contentProcessor.js` 里，必须要加装一个**「自愈判定阀」**：\n\n> **核心逻辑**：只有当 `Marked.parser` 的当前 **AST 嵌套深度等于 0（`astDepth === 0`）**，且不处于任何未闭合的代码块/表格内部时，才允许执行 `<!--brk-->` 物理切片！\n> 如果在深度嵌套里遇到了 `<!--brk-->`，则将其自动**挂起并延后**，直到检测到当前容器完全 `</div>` 闭合，再在根节点上执行优雅 of “呼吸切片”！";
+        let nodes1 = parse_markdown_to_ast(text1);
+        assert_eq!(nodes1.len(), 2);
+
+        // 验证第一行中的“自愈判定阀”被正确加粗了
+        if let MarkdownNode::Paragraph { children, .. } = &nodes1[0] {
+            // “自愈判定阀”在第 6 个子节点（i = 5）
+            if let InlineNode::Strong {
+                children: strong_children,
+                ..
+            } = &children[5]
+            {
+                assert_eq!(strong_children.len(), 1);
+                assert_eq!(
+                    strong_children[0],
+                    InlineNode::text("\u{200b}「自愈判定阀」\u{200b}".to_string())
+                );
+            } else {
+                panic!("Expected Strong for self-cure valve");
+            }
+        }
+
+        // 3. 原本的四星号并排加粗引号测试
+        let text = "看哪些**“应该加粗的部分没有加粗”**，或者**“不该加粗的部分泄漏了”**";
+        let nodes = parse_markdown_to_ast(text);
+        assert_eq!(nodes.len(), 1);
+        if let MarkdownNode::Paragraph { children, .. } = &nodes[0] {
+            assert_eq!(children.len(), 4);
+            assert_eq!(children[0], InlineNode::text("看哪些".to_string()));
+            if let InlineNode::Strong {
+                children: strong_children,
+                ..
+            } = &children[1]
+            {
+                assert_eq!(strong_children.len(), 3);
+                assert_eq!(strong_children[0], InlineNode::text("\u{200b}".to_string()));
+                assert_eq!(strong_children[2], InlineNode::text("\u{200b}".to_string()));
+                if let InlineNode::VcpCustom {
+                    kind,
+                    children: Some(q_ch),
+                    ..
+                } = &strong_children[1]
+                {
+                    assert_eq!(kind, "quote");
+                    assert_eq!(
+                        q_ch[1],
+                        InlineNode::text("应该加粗的部分没有加粗".to_string())
+                    );
+                } else {
+                    panic!("Expected quote 1");
+                }
+            } else {
+                panic!("Expected Strong 1");
+            }
+
+            assert_eq!(children[2], InlineNode::text("，或者".to_string()));
+
+            if let InlineNode::Strong {
+                children: strong_children,
+                ..
+            } = &children[3]
+            {
+                assert_eq!(strong_children.len(), 3);
+                assert_eq!(strong_children[0], InlineNode::text("\u{200b}".to_string()));
+                assert_eq!(strong_children[2], InlineNode::text("\u{200b}".to_string()));
+                if let InlineNode::VcpCustom {
+                    kind,
+                    children: Some(q_ch),
+                    ..
+                } = &strong_children[1]
+                {
+                    assert_eq!(kind, "quote");
+                    assert_eq!(
+                        q_ch[1],
+                        InlineNode::text("不该加粗的部分泄漏了".to_string())
+                    );
+                } else {
+                    panic!("Expected quote 2");
+                }
+            } else {
+                panic!("Expected Strong 2");
+            }
+        }
+    }
+
+    #[test]
+    fn test_user_reproduce() {
+        let text = include_str!("../fixtures/Strong.txt");
+        let nodes = parse_markdown_to_ast(text);
+
+        // 查找包含“自愈判定阀”的 Strong 节点
+        let mut found = false;
+        for node in &nodes {
+            if let MarkdownNode::Paragraph { children, .. } = node {
+                for child in children {
+                    if let InlineNode::Strong {
+                        children: strong_children,
+                        ..
+                    } = child
+                    {
+                        if strong_children.len() > 0 {
+                            if let InlineNode::Text { value, .. } = &strong_children[0] {
+                                if value.contains("自愈判定阀") {
+                                    found = true;
+                                    // 检查是否正确包含零宽空格
+                                    assert!(value.contains("\u{200b}「自愈判定阀」\u{200b}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "Could not find bolded '自愈判定阀' node in Strong.txt"
+        );
+    }
+
+    #[test]
+    fn test_code_block_nesting_isolation() {
+        // 外层 4 个反引号，内层 3 个反引号
+        let text = "````markdown\n这是一段嵌套代码块：\n```rust\nfn main() {\n    // **这不该被flanking修改**\n    let a = \"**hello**\";\n}\n```\n````";
+        let fixed = fix_flanking_delimiters(text);
+
+        // 应该完全没有任何修改，因为这段内容全部在 4 个反引号的代码围栏中
+        assert_eq!(fixed, text);
+    }
+
+    #[test]
+    fn test_brk_text_37() {
+        // 真实样本 brk.txt，覆盖 parse_content 切分（include_str! 编译期内嵌，杜绝绝对路径）
+        let text = include_str!("../fixtures/brk.txt");
+        // 模拟 content_parser.rs 的 parse_content 切分
+        let blocks = crate::vcp_modules::content_parser::parse_content(text);
+        // 断言切分出至少一个块（原诊断 println 已转为 assert）
+        assert!(
+            !blocks.is_empty(),
+            "brk.txt 经 parse_content 后应至少切分出一个块"
+        );
+    }
 }

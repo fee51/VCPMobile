@@ -41,7 +41,7 @@ pub enum DbWriteTask {
     TopicMessages {
         topic_id: String,
         messages: Vec<crate::vcp_modules::chat_manager::ChatMessage>,
-        compressed_contents: Vec<Vec<u8>>,
+        contents: Vec<String>,
         render_bytes: Vec<Vec<u8>>,
         content_hashes: Vec<String>,
         skip_bubble: bool,
@@ -171,11 +171,11 @@ impl DbWriteQueue {
                                     Self::rusqlite_upsert_group_topic(&tx, &tid, &dto)?;
                                 }
                             }
-                            DbWriteTask::TopicMessages { topic_id, messages, compressed_contents, render_bytes, content_hashes, skip_bubble } => {
+                            DbWriteTask::TopicMessages { topic_id, messages, contents, render_bytes, content_hashes, skip_bubble } => {
                                 if !skip_bubble {
                                     affected_topics.insert(topic_id.clone());
                                 }
-                                Self::rusqlite_upsert_messages_batch(&tx, &topic_id, messages, compressed_contents, render_bytes, content_hashes)?;
+                                Self::rusqlite_upsert_messages_batch(&tx, &topic_id, messages, contents, render_bytes, content_hashes)?;
                             }
                             DbWriteTask::Flush { .. } => unreachable!(),
                         }
@@ -441,7 +441,7 @@ impl DbWriteQueue {
         tx: &rusqlite::Transaction,
         topic_id: &str,
         messages: Vec<ChatMessage>,
-        compressed_contents: Vec<Vec<u8>>,
+        contents: Vec<String>,
         render_bytes: Vec<Vec<u8>>,
         content_hashes: Vec<String>,
     ) -> rusqlite::Result<()> {
@@ -501,7 +501,7 @@ impl DbWriteQueue {
                 params_msgs.push(Box::new(msg.role.clone()));
                 params_msgs.push(Box::new(msg.name.clone()));
                 params_msgs.push(Box::new(msg.agent_id.clone()));
-                params_msgs.push(Box::new(compressed_contents[*idx].clone()));
+                params_msgs.push(Box::new(contents[*idx].clone()));
                 params_msgs.push(Box::new(msg.timestamp as i64));
                 params_msgs.push(Box::new(msg.is_group_message.unwrap_or(false)));
                 params_msgs.push(Box::new(msg.group_id.clone()));
@@ -555,6 +555,48 @@ impl DbWriteQueue {
                     params_render.iter().map(|p| p.as_ref()).collect();
                 stmt_render.execute(&*refs_render)?;
             }
+        }
+
+        // Phase 3.5: 全文检索 FTS5 批量同步
+        let msg_ids_for_fts: Vec<String> = messages.iter().map(|msg| msg.id.clone()).collect();
+        for chunk in msg_ids_for_fts.chunks(998) {
+            // SQLite 参数上限，预留 1 个给 topic_id
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql_del_fts = format!(
+                "DELETE FROM messages_fts WHERE topic_id = ? AND msg_id IN ({})",
+                placeholders
+            );
+            let mut stmt_del_fts = tx.prepare_cached(&sql_del_fts)?;
+
+            let mut params: Vec<String> = Vec::with_capacity(chunk.len() + 1);
+            params.push(topic_id.to_string());
+            for id in chunk {
+                params.push(id.clone());
+            }
+            stmt_del_fts.execute(rusqlite::params_from_iter(params))?;
+        }
+
+        const PARAMS_PER_FTS: usize = 3;
+        let fts_chunk_size = MAX_PARAMS / PARAMS_PER_FTS;
+        for chunk in messages.chunks(fts_chunk_size) {
+            let mut sql_ins_fts =
+                String::from("INSERT INTO messages_fts (msg_id, topic_id, content) VALUES ");
+            for i in 0..chunk.len() {
+                if i > 0 {
+                    sql_ins_fts.push_str(", ");
+                }
+                sql_ins_fts.push_str("(?, ?, ?)");
+            }
+            let mut stmt_ins_fts = tx.prepare_cached(&sql_ins_fts)?;
+            let mut params_fts: Vec<String> = Vec::new();
+            for msg in chunk {
+                let search_content =
+                    crate::vcp_modules::db_manager::preprocess_fts_text(&msg.content);
+                params_fts.push(msg.id.clone());
+                params_fts.push(topic_id.to_string());
+                params_fts.push(search_content);
+            }
+            stmt_ins_fts.execute(rusqlite::params_from_iter(params_fts))?;
         }
 
         // Phase 4: Attachment Optimization

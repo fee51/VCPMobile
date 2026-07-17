@@ -1,7 +1,7 @@
 // group_chat_application_service.rs: 编排群聊工作流
 // 职责: 1. 读取配置 2. 保存消息 3. 决策发言者 4. 组装上下文 5. 执行 AI 调用 6. 发射事件
 
-use crate::vcp_modules::agent_service::{read_agent_config, AgentConfigState};
+use crate::vcp_modules::agent_service::{read_agent_config_internal, AgentConfigState};
 use crate::vcp_modules::chat_manager::ChatMessage;
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::group_context_assembler::assemble_group_context;
@@ -68,13 +68,8 @@ pub async fn internal_process_group_chat_message(
     // 2. 加载成员配置
     let mut active_member_configs = Vec::new();
     for member_id in &group_config.members {
-        if let Ok(cfg) = read_agent_config(
-            app_handle.clone(),
-            agent_state.clone(),
-            member_id.clone(),
-            Some(false),
-        )
-        .await
+        if let Ok(cfg) =
+            read_agent_config_internal(&app_handle, &agent_state, member_id, Some(false)).await
         {
             active_member_configs.push(cfg);
         }
@@ -202,7 +197,9 @@ pub async fn internal_process_group_chat_message(
         // 构造请求载荷
         let mut model_config = json!({
             "model": model_to_use,
-            "stream": true
+            "max_tokens": speaker.max_output_tokens,
+            "contextTokenLimit": speaker.context_token_limit,
+            "stream": speaker.stream_output
         });
         if speaker.use_temperature {
             model_config["temperature"] = json!(speaker.temperature);
@@ -286,6 +283,7 @@ pub async fn internal_process_group_chat_message(
                     is_aborted,
                     finish_reason.clone(),
                     stream_channel.clone(),
+                    Some(agent_id.clone()),
                 )
                 .await?;
 
@@ -318,6 +316,10 @@ pub async fn internal_process_group_chat_message(
                 agent_id,
                 e
             );
+            let _ = sqlx::query("DELETE FROM active_generations WHERE msg_id = ?")
+                .bind(&message_id)
+                .execute(&db_pool)
+                .await;
         }
     }
 
@@ -375,7 +377,7 @@ pub async fn handle_group_chat_message(
             vcp_api_key: payload.vcp_api_key,
             stream_channel: Some(stream_channel),
         },
-        true, // append_user_msg
+        false, // append_user_msg
     )
     .await
 }

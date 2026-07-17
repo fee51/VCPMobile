@@ -35,7 +35,7 @@ pub async fn handle_agent_chat_message(
         active_requests,
         payload,
         stream_channel,
-        true, // append_user_msg
+        false, // append_user_msg
     )
     .await
 }
@@ -117,7 +117,7 @@ pub async fn internal_process_agent_chat_message(
         "model": agent_config.model,
         "max_tokens": agent_config.max_output_tokens,
         "contextTokenLimit": agent_config.context_token_limit,
-        "stream": true
+        "stream": agent_config.stream_output
     });
     if agent_config.use_temperature {
         model_config["temperature"] = json!(agent_config.temperature);
@@ -181,12 +181,17 @@ pub async fn internal_process_agent_chat_message(
                     is_aborted,
                     finish_reason,
                     Some(stream_channel),
+                    Some(agent_id.clone()),
                 )
                 .await?;
             }
         }
         Err(e) => {
             log::error!("[AgentChatAppService] perform_vcp_request failed: {}", e);
+            let _ = sqlx::query("DELETE FROM active_generations WHERE msg_id = ?")
+                .bind(&thinking_id)
+                .execute(&db_state.pool)
+                .await;
         }
     }
 
@@ -256,7 +261,7 @@ pub async fn handle_assistant_chat_stream(
         "model": agent_config.model,
         "max_tokens": agent_config.max_output_tokens,
         "contextTokenLimit": agent_config.context_token_limit,
-        "stream": true
+        "stream": agent_config.stream_output
     });
     if agent_config.use_temperature {
         model_config["temperature"] = json!(agent_config.temperature);

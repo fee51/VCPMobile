@@ -19,6 +19,13 @@ lazy_static::lazy_static! {
     static ref CURRENT_INFO_STATUS: Arc<RwLock<String>> = Arc::new(RwLock::new("closed".to_string()));
 }
 
+fn emit_info_event<R: tauri::Runtime>(app: &AppHandle<R>, payload: serde_json::Value) {
+    if !crate::vcp_modules::infra::lifecycle_manager::is_app_in_foreground(app) {
+        return;
+    }
+    let _ = app.emit("vcp-info-event", payload);
+}
+
 fn next_id_counter() -> u64 {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -82,8 +89,8 @@ pub async fn clear_vcp_info(app: AppHandle) -> Result<(), String> {
         compressed_map.clear();
     }
     // 2. 广播给前端
-    let _ = app.emit(
-        "vcp-info-event",
+    emit_info_event(
+        &app,
         serde_json::json!({
             "type": "vcp-info-clear"
         }),
@@ -157,8 +164,8 @@ async fn start_vcp_info_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
             *CURRENT_INFO_STATUS.write().await = "connecting".to_string();
         }
 
-        let _ = app_handle.emit(
-            "vcp-info-event",
+        emit_info_event(
+            &app_handle,
             serde_json::json!({
                 "type": "vcp-info-status",
                 "status": "connecting",
@@ -225,110 +232,143 @@ async fn start_vcp_info_listener<R: tauri::Runtime>(app_handle: AppHandle<R>) {
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36".parse().unwrap()
         );
 
-        match tokio::time::timeout(Duration::from_secs(10), connect_async(request)).await {
-            Ok(connection_result) => match connection_result {
-                Ok((ws_stream, _)) => {
-                    retry_delay = Duration::from_millis(1000);
-                    {
-                        *CURRENT_INFO_STATUS.write().await = "connected".to_string();
+        let mut connection_succeeded = false;
+        let mut ws_stream_opt = None;
+        let mut interrupted_by_url_change = false;
+
+        let connect_fut = connect_async(request);
+
+        tokio::select! {
+            _ = url_rx.changed() => {
+                log::info!("[VCPInfo] URL changed during connection attempt, aborting.");
+                interrupted_by_url_change = true;
+            }
+            res = tokio::time::timeout(Duration::from_secs(5), connect_fut) => {
+                match res {
+                    Ok(Ok((ws_stream, _))) => {
+                        ws_stream_opt = Some(ws_stream);
+                        connection_succeeded = true;
                     }
-                    log::info!("[VCPInfo] Connected successfully to {}", masked_url);
+                    Ok(Err(e)) => {
+                        {
+                            *CURRENT_INFO_STATUS.write().await = "error".to_string();
+                        }
+                        log::error!("[VCPInfo] Connection Error: {}", e);
+                        emit_info_event(
+                            &app_handle,
+                            serde_json::json!({
+                                "type": "vcp-info-status",
+                                "status": "error",
+                                "message": "连接错误",
+                                "source": "VCPInfo"
+                            }),
+                        );
+                    }
+                    Err(_) => {
+                        {
+                            *CURRENT_INFO_STATUS.write().await = "error".to_string();
+                        }
+                        log::error!("[VCPInfo] Connection timed out after 5 seconds.");
+                        emit_info_event(
+                            &app_handle,
+                            serde_json::json!({
+                                "type": "vcp-info-status",
+                                "status": "error",
+                                "message": "连接超时",
+                                "source": "VCPInfo"
+                            }),
+                        );
+                    }
+                }
+            }
+        }
 
-                    let (mut ws_write, mut ws_read) = ws_stream.split();
+        if interrupted_by_url_change {
+            continue;
+        }
 
-                    let _ = app_handle.emit(
-                        "vcp-info-event",
-                        serde_json::json!({
-                            "type": "vcp-info-status",
-                            "status": "connected",
-                            "message": "已连接",
-                            "source": "VCPInfo"
-                        }),
-                    );
+        if connection_succeeded {
+            if let Some(ws_stream) = ws_stream_opt {
+                retry_delay = Duration::from_millis(1000);
+                {
+                    *CURRENT_INFO_STATUS.write().await = "connected".to_string();
+                }
+                log::info!("[VCPInfo] Connected successfully to {}", masked_url);
 
-                    let mut heartbeat_timer = Box::pin(sleep(Duration::from_secs(15)));
+                let (mut ws_write, mut ws_read) = ws_stream.split();
 
-                    loop {
-                        tokio::select! {
-                            // 监听 URL 变更
-                            _ = url_rx.changed() => {
+                emit_info_event(
+                    &app_handle,
+                    serde_json::json!({
+                        "type": "vcp-info-status",
+                        "status": "connected",
+                        "message": "已连接",
+                        "source": "VCPInfo"
+                    }),
+                );
+
+                let mut heartbeat_timer = Box::pin(sleep(Duration::from_secs(15)));
+
+                loop {
+                    tokio::select! {
+                    // 监听 URL 变更并防止 Flapping 瞬断
+                    _ = url_rx.changed() => {
+                        let new_val = url_rx.borrow().clone();
+                        if let Some(new_u) = new_val {
+                            if new_u != ws_url {
                                 log::info!("[VCPInfo] URL changed, closing current connection.");
                                 break;
+                            } else {
+                                log::info!("[VCPInfo] URL changed event fired but value is identical. Ignoring to prevent flapping.");
                             }
-                            // 心跳周期触发
-                            _ = &mut heartbeat_timer => {
-                                if let Err(e) = ws_write.send(Message::Ping(vec![].into())).await {
-                                    log::error!("[VCPInfo] Failed to send Ping: {}", e);
-                                    break;
-                                }
-                                heartbeat_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(15));
+                        } else {
+                            log::info!("[VCPInfo] URL cleared, closing connection.");
+                            break;
+                        }
+                    }
+                        // 心跳周期触发
+                        _ = &mut heartbeat_timer => {
+                            if let Err(e) = ws_write.send(Message::Ping(vec![].into())).await {
+                                log::error!("[VCPInfo] Failed to send Ping: {}", e);
+                                break;
                             }
-                            // 处理接收到的消息
-                            msg_result = ws_read.next() => {
-                                match msg_result {
-                                    Some(Ok(msg)) => {
-                                        if msg.is_text() {
-                                            let text = msg.to_text().unwrap_or_default();
-                                            if let Ok(payload) = serde_json::from_str::<Value>(text) {
-                                                // 提取、缓存并推送消息
-                                                process_incoming_vcp_info(&app_handle, payload, text).await;
-                                            }
+                            heartbeat_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(15));
+                        }
+                        // 处理接收到的消息
+                        msg_result = ws_read.next() => {
+                            match msg_result {
+                                Some(Ok(msg)) => {
+                                    if msg.is_text() {
+                                        let text = msg.to_text().unwrap_or_default();
+                                        if let Ok(payload) = serde_json::from_str::<Value>(text) {
+                                            // 提取、缓存并推送消息
+                                            process_incoming_vcp_info(&app_handle, payload, text).await;
                                         }
                                     }
-                                    Some(Err(e)) => {
-                                        log::error!("[VCPInfo] WebSocket error during read: {}", e);
-                                        break;
-                                    }
-                                    None => {
-                                        log::warn!("[VCPInfo] Connection closed by server.");
-                                        break;
-                                    }
+                                }
+                                Some(Err(e)) => {
+                                    log::error!("[VCPInfo] WebSocket error during read: {}", e);
+                                    break;
+                                }
+                                None => {
+                                    log::warn!("[VCPInfo] Connection closed by server.");
+                                    break;
                                 }
                             }
                         }
                     }
+                }
 
-                    log::info!("[VCPInfo] Disconnected from {}.", ws_url);
-                    {
-                        *CURRENT_INFO_STATUS.write().await = "closed".to_string();
-                    }
-                    let _ = app_handle.emit(
-                        "vcp-info-event",
-                        serde_json::json!({
-                            "type": "vcp-info-status",
-                            "status": "closed",
-                            "message": "连接已断开",
-                            "source": "VCPInfo"
-                        }),
-                    );
-                }
-                Err(e) => {
-                    {
-                        *CURRENT_INFO_STATUS.write().await = "error".to_string();
-                    }
-                    log::error!("[VCPInfo] Connection Error: {}", e);
-                    let _ = app_handle.emit(
-                        "vcp-info-event",
-                        serde_json::json!({
-                            "type": "vcp-info-status",
-                            "status": "error",
-                            "message": "连接错误",
-                            "source": "VCPInfo"
-                        }),
-                    );
-                }
-            },
-            Err(_) => {
+                log::info!("[VCPInfo] Disconnected from {}.", ws_url);
                 {
-                    *CURRENT_INFO_STATUS.write().await = "error".to_string();
+                    *CURRENT_INFO_STATUS.write().await = "closed".to_string();
                 }
-                log::error!("[VCPInfo] Connection timed out after 10 seconds.");
-                let _ = app_handle.emit(
-                    "vcp-info-event",
+                emit_info_event(
+                    &app_handle,
                     serde_json::json!({
                         "type": "vcp-info-status",
-                        "status": "error",
-                        "message": "连接超时",
+                        "status": "closed",
+                        "message": "连接已断开",
                         "source": "VCPInfo"
                     }),
                 );
@@ -375,8 +415,8 @@ async fn process_incoming_vcp_info<R: tauri::Runtime>(
                 }
 
                 // 5. 发送前端广播事件
-                let _ = app_handle.emit(
-                    "vcp-info-event",
+                emit_info_event(
+                    app_handle,
                     serde_json::json!({
                         "type": "vcp-info-message",
                         "data": metadata

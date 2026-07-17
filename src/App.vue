@@ -16,7 +16,26 @@ import { useAutoUpdate } from "./core/composables/useAutoUpdate";
 import { useChatSessionStore } from "./core/stores/chatSessionStore";
 import { useAssistantStore } from "./core/stores/assistant";
 import { useSettingsStore } from "./core/stores/settings";
-import { reapplyScreenKeepIfActive, suspendPhysicalScreenKeep } from "./core/composables/useScreenKeeper";
+import { useAppLifecycle } from "./core/composables/useAppLifecycle";
+
+// 初始化应用生命周期监听
+useAppLifecycle();
+
+
+// Native safe-area bridge: CSS env(safe-area-inset-bottom) often reports 0
+// on Android WebView even when viewport-fit=cover is set. This takes the real
+// value from WindowInsetsCompat (always accurate) and overrides --vcp-safe-bottom
+// directly, replacing the static 48px floor defined in themes.css.
+const handleSafeAreaInset = (e: Event) => {
+  const detail = (e as CustomEvent<{ safeAreaBottom?: number }>).detail;
+  if (detail && typeof detail.safeAreaBottom === 'number' && detail.safeAreaBottom > 0) {
+    const dpr = window.devicePixelRatio || 1;
+    document.documentElement.style.setProperty(
+      '--vcp-safe-bottom',
+      `${Math.round(detail.safeAreaBottom / dpr)}px`,
+    );
+  }
+};
 
 // Layout Components
 import PermissionGate from "./components/layout/PermissionGate.vue";
@@ -64,6 +83,7 @@ const router = useRouter();
 
 const { initRootHistory } = useModalHistory();
 
+// [SUSPENDED BETA] isAssistant 用于标识浮动助手窗口模式，当前入口已关闭，保留以支持后续重启
 const isAssistant = ref(false);
 
 // --- Share Intent State ---
@@ -157,6 +177,44 @@ const handleShareSelectorClose = () => {
   showShareSelector.value = false;
 };
 
+// --- Notification Click Routing State & Logic ---
+const handleNotificationClick = (e: Event) => {
+  const detail = (e as CustomEvent).detail;
+  processNotificationClick(detail);
+};
+
+const processNotificationClick = (detail: any) => {
+  console.log("[App] Notification click received:", detail);
+  if (!detail?.ownerId || !detail?.topicId) return;
+
+  if (lifecycleStore.state !== "READY") {
+    console.log("[App] Core not ready yet, deferring notification click routing...");
+    const unwatch = watch(
+      () => lifecycleStore.state,
+      (state) => {
+        if (state === "READY") {
+          unwatch();
+          processNotificationClick(detail);
+        }
+      }
+    );
+    return;
+  }
+
+  // 1. 关闭所有弹出的 Modals
+  const { closeTopModal, modalStackLength } = useModalHistory();
+  while (modalStackLength() > 0) {
+    closeTopModal();
+  }
+
+  // 2. 关闭侧边栏
+  layoutStore.setLeftDrawer(false);
+  layoutStore.setRightDrawer(false);
+
+  // 3. 切换话题
+  sessionStore.selectTopicById(detail.ownerId, detail.topicId);
+};
+
 // --- Global Swipe Logic for Sidebar ---
 const appRootRef = ref<HTMLElement | null>(null);
 useSidebarSwipe(appRootRef, { type: "global" });
@@ -177,6 +235,8 @@ const bootstrapApp = async () => {
     console.error("[App] Bootstrap failed:", error);
   }
 };
+
+
 
 const backgroundStyle = computed(() => {
   const themeInfo = themeStore.currentThemeInfo || themeStore.availableThemes.find(
@@ -265,10 +325,6 @@ const handleExitRequest = async () => {
       toastOnly: true,
     });
 
-    if (typeof navigator !== "undefined" && navigator.vibrate) {
-      navigator.vibrate(50);
-    }
-
     exitTimer = window.setTimeout(() => {
       isWaitingExit.value = false;
       exitTimer = null;
@@ -277,47 +333,8 @@ const handleExitRequest = async () => {
 };
 
 
-const handleVisibilityChange = () => {
-  if (document.hidden) {
-    document.documentElement.classList.add("vcp-paused-animations");
-  } else {
-    document.documentElement.classList.remove("vcp-paused-animations");
-  }
-};
 
-let isAppBackground = false;
-
-const handleVcpLifecycle = (e: Event) => {
-  if (isAssistant.value) return;
-
-  const detail = (e as CustomEvent).detail;
-  const state = detail?.state;
-  
-  if (state === "stop" || state === "pause") {
-    if (isAppBackground) return;
-    isAppBackground = true;
-    console.log("[Lifecycle] App moved to background, tuning heartbeat to 120s...");
-    suspendPhysicalScreenKeep(); // 休眠物理亮屏，达到省电效果
-    invoke("set_vcp_log_heartbeat", { intervalMs: 120000 }).catch((err) => {
-      console.error("[Lifecycle] Failed to set background heartbeat:", err);
-    });
-  } else if (state === "resume") {
-    if (!isAppBackground) return;
-    isAppBackground = false;
-    console.log("[Lifecycle] App moved to foreground, restoring heartbeat to 15s...");
-    reapplyScreenKeepIfActive(); // 唤醒时自动校准和恢复可能丢失的物理亮屏 FLAG
-    invoke("set_vcp_log_heartbeat", { intervalMs: 15000 }).catch((err) => {
-      console.error("[Lifecycle] Failed to restore foreground heartbeat:", err);
-    });
-    invoke("start_manual_sync").catch((err) => {
-      console.error("[Lifecycle] Failed to resume automatic sync:", err);
-    });
-    lifecycleStore.hydrateSystemStatus().catch((err) => {
-      console.error("[Lifecycle] Failed to hydrate system status:", err);
-    });
-  }
-};
-
+// [SUSPENDED BETA] 悬浮球点击打开浮动助手窗口，当前功能已暂停使用，事件监听保留但入口关闭
 const handleFloatingBallClick = async () => {
   console.log("[App] Floating ball clicked. Resolving assistant window...");
   try {
@@ -365,10 +382,12 @@ onMounted(async () => {
   // 1. 同步挂载基础物理按键与系统事件监听 (混合应用黄金铁律：物理拦截最优先挂载，杜绝初始化阻塞失效)
   window.addEventListener("vcp-exit-requested", handleExitRequest);
   window.addEventListener("vcp-hardware-back", handleExitRequest);
-  document.addEventListener("visibilitychange", handleVisibilityChange);
-  window.addEventListener("vcp-lifecycle", handleVcpLifecycle);
+  // [SUSPENDED BETA] 悬浮球点击事件保留，但浮动助手功能当前已暂停使用
   window.addEventListener("vcp-floating-ball-click", handleFloatingBallClick);
   window.addEventListener("vcp-share-intent", handleShareIntent);
+  window.addEventListener("vcp-notification-click", handleNotificationClick);
+  window.addEventListener("vcp-keyboard-inset", handleSafeAreaInset);
+
 
   // 初始化全局表情包修复器
   initGlobalFixer();
@@ -394,16 +413,29 @@ onMounted(async () => {
   router.afterEach(() => {
     initRootHistory();
   });
+
+  // 3. 处理冷启动的通知栏点击
+  if (!isAssistant.value) {
+    try {
+      const pending = await invoke<any>("plugin:vcp-mobile|get_pending_notification");
+      if (pending && pending.topicId) {
+        processNotificationClick(pending);
+      }
+    } catch (err) {
+      console.warn("[App] Failed to fetch pending notification click:", err);
+    }
+  }
 });
 
 onUnmounted(() => {
   if (unlistenLog) unlistenLog();
   window.removeEventListener("vcp-exit-requested", handleExitRequest);
   window.removeEventListener("vcp-hardware-back", handleExitRequest);
-  document.removeEventListener("visibilitychange", handleVisibilityChange);
-  window.removeEventListener("vcp-lifecycle", handleVcpLifecycle);
   window.removeEventListener("vcp-floating-ball-click", handleFloatingBallClick);
   window.removeEventListener("vcp-share-intent", handleShareIntent);
+  window.removeEventListener("vcp-notification-click", handleNotificationClick);
+  window.removeEventListener("vcp-keyboard-inset", handleSafeAreaInset);
+
 });
 </script>
 
@@ -423,7 +455,7 @@ onUnmounted(() => {
       :class="themeStore.isDarkResolved ? 'bg-black/12' : 'bg-transparent'"></div>
 
     <!-- 2. 主内容区先渲染，抽屉与遮罩在后声明，靠 DOM 顺位自然覆盖 -->
-    <main class="flex-1 min-w-0 relative overflow-hidden">
+    <main v-if="lifecycleStore.state === 'READY'" class="flex-1 min-w-0 relative overflow-hidden">
       <router-view v-slot="{ Component }">
         <component v-if="Component" :is="Component" />
       </router-view>
@@ -472,11 +504,6 @@ onUnmounted(() => {
 
 <style>
 /* 全局基础样式保持不变 */
-:root {
-  --vcp-safe-top: 0px;
-  --vcp-safe-bottom: 0px;
-}
-
 html,
 body,
 #app {
@@ -528,15 +555,11 @@ body,
 }
 
 .mb-safe {
-  margin-bottom: var(--vcp-safe-bottom, 20px);
+  margin-bottom: var(--vcp-safe-bottom, 48px);
 }
 
-/* 移动端适配：安全区域 */
-@supports (padding-top: env(safe-area-inset-top)) {
-  :root {
-    --vcp-safe-top: env(safe-area-inset-top);
-    --vcp-safe-bottom: env(safe-area-inset-bottom);
-  }
+.pb-safe {
+  padding-bottom: var(--vcp-safe-bottom, 48px);
 }
 
 /* 全局动画暂停：切到后台时由 JS 添加此 class 到 <html> */

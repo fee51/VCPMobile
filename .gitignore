@@ -32,14 +32,14 @@ vcp-mobile.keystore
 # AI Knowledge Base & Docs
 plans_back.zip
 .gemini_snapshot.json
-GEMINI.md
 *.md
 !docs/**/*.md
 !README.md
+!CLAUDE.md
 VCPMobile.code-workspace
 
 # Large Assets & Scripts
-scripts/
+/scripts/
 plans/Archive_Assets/
 # Local Release Artifacts
 releases/
@@ -49,6 +49,7 @@ vector/
 .cargo
 temp
 
+.agent
 .claude
 .kilo
 .kilocode
@@ -57,6 +58,7 @@ temp
 
 # Tauri build output (copied from dist/ on each build)
 src-tauri/gen/android/app/src/main/assets/
+
 # Android plugin build artifacts
 src-tauri/plugins/**/android/build/
 src-tauri/plugins/**/android/.tauri/

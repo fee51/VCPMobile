@@ -81,6 +81,19 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         hash: Option<u64>,
     },
+    #[serde(rename = "tool-call-summary")]
+    ToolCallSummary {
+        items: Vec<ToolCallSummaryItem>,
+        raw_content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hash: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
+pub struct ToolCallSummaryItem {
+    pub tool_name: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash)]
@@ -188,6 +201,14 @@ impl ContentBlock {
         }
     }
 
+    pub fn tool_call_summary(items: Vec<ToolCallSummaryItem>, raw_content: String) -> Self {
+        Self::ToolCallSummary {
+            items,
+            raw_content,
+            hash: None,
+        }
+    }
+
     pub fn compute_hash(&self) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.hash(&mut hasher);
@@ -205,6 +226,7 @@ impl ContentBlock {
             ContentBlock::HtmlPreview { hash, .. } => *hash = Some(h),
             ContentBlock::RoleDivider { hash, .. } => *hash = Some(h),
             ContentBlock::Style { hash, .. } => *hash = Some(h),
+            ContentBlock::ToolCallSummary { hash, .. } => *hash = Some(h),
         }
     }
 
@@ -227,6 +249,7 @@ pub(crate) enum BlockType {
     Style,
     RoleDivider,
     CodeFence,
+    ToolCallSummary,
 }
 
 lazy_static! {
@@ -267,8 +290,13 @@ lazy_static! {
         Regex::new(r"(?im)^[ \t]*<(div|section|article|header|footer|main|aside|figure|figcaption)\b[^>]*>").unwrap();
 
     pub(crate) static ref ROLE_DIVIDER: Regex = Regex::new(r"(?im)^[ \t]*<<<\[(END_)?ROLE_DIVIDE_(SYSTEM|ASSISTANT|USER)\]>>>").unwrap();
-    pub(crate) static ref STYLE_TAG_START: Regex = Regex::new(r"(?im)^[ \t]*<style\b[^>]*>").unwrap();
+    pub(crate) static ref STYLE_TAG_START: Regex = Regex::new(r"(?im)^[ \t]*<style\b[^>]*>?").unwrap();
     pub(crate) static ref STYLE_TAG_END: Regex = Regex::new(r"(?i)</style>").unwrap();
+    pub(crate) static ref TOOL_CALL_SUMMARY_START: Regex = Regex::new(r"(?im)^[ \t]*\[本轮工具调用摘要:\]").unwrap();
+    pub(crate) static ref TOOL_CALL_SUMMARY_END: Regex = Regex::new(r"(?im)^[ \t]*\[本轮工具调用摘要结束\]").unwrap();
+
+    pub(crate) static ref HTML_TAG_BLOCK_RE: Regex =
+        Regex::new(r"(?im)^[ \t]*<(?:style\b[^>]*>?|html[\s>]|!doctype\s+html|/?(?:div|section|article|header|footer|main|aside|figure|figcaption)\b[^>]*>)").unwrap();
 
     pub(crate) static ref GENERIC_CODE_FENCE_START: Regex = Regex::new(r"(?im)^[ \t]*```[a-zA-Z0-9-]*[ \t]*\r?$").unwrap();
     pub(crate) static ref GENERIC_CODE_FENCE_END: Regex = Regex::new(r"(?im)^[ \t]*```[ \t]*\r?$").unwrap();
@@ -294,15 +322,11 @@ fn is_natural_language_line_start(c: char) -> bool {
         || ('\u{AC00}'..='\u{D7AF}').contains(&c)
         || ('\u{F900}'..='\u{FAFF}').contains(&c)
         || ('\u{FE30}'..='\u{FE4F}').contains(&c)
-        || ('\u{FF01}'..='\u{FF60}').contains(&c)
+        || ('\u{FF00}'..='\u{FFEF}').contains(&c)
         || ('\u{FFE0}'..='\u{FFE6}').contains(&c)
-        || matches!(
-            c,
-            '\u{201C}' | '\u{201D}' | // " "
-            '\u{2018}' | '\u{2019}' | // ' '
-            '\u{2026}' | // …
-            '\u{2014}' // —
-        )
+        || ('\u{2000}'..='\u{206F}').contains(&c)
+        || ('\u{25A0}'..='\u{25FF}').contains(&c)
+        || c == '\u{00B7}'
 }
 
 #[inline]
@@ -370,6 +394,31 @@ pub fn de_indent_misinterpreted_code_blocks(text: &str) -> String {
     result
 }
 
+fn find_matching_fence_end(
+    search_area: &str,
+    start_marker_text: &str,
+) -> (Option<usize>, Option<usize>, bool) {
+    let trimmed = start_marker_text.trim_start();
+    let fence_char = match trimmed.chars().next() {
+        Some(c) if c == '`' => c,
+        _ => return (None, None, false),
+    };
+    let count = trimmed.chars().take_while(|&c| c == fence_char).count();
+    if count < 3 {
+        return (None, None, false);
+    }
+
+    let regex_str = format!(r"(?m)^[ \t]{{0,3}}\`{{{},}}[ \t]*\r?$", count);
+
+    if let Ok(re) = Regex::new(&regex_str) {
+        if let Some(m) = re.find(search_area) {
+            return (Some(m.start()), Some(m.end()), true);
+        }
+    }
+
+    (None, None, false)
+}
+
 /// 核心解析函数：将原始 Markdown 文本解析为 AST 块数组
 pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
     let deindented_text = de_indent_misinterpreted_code_blocks(raw_text);
@@ -388,12 +437,13 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
             r"(<think(?:ing)?>)|",                                     // 3
             r"(^[ \t]*\[\[VCP调用结果信息汇总:)|",                     // 4
             r"(^[ \t]*<<<DailyNoteStart>>>)|",                         // 5
-            r"(^[ \t]*```html[ \t]*$)|",                               // 6
+            r"(^[ \t]*`{3,}html[ \t]*$)|",                             // 6
             r"(^[ \t]*(?:<!doctype html>|<html[\s>]))|",               // 7
             r"(^[ \t]*<<<\[(?:END_)?ROLE_DIVIDE_(?:SYSTEM|ASSISTANT|USER)\]>>>)|", // 8
             r"(^[ \t]*<style\b[^>]*>)|",                                      // 9
-            r"(^[ \t]*```[a-zA-Z0-9-]*[ \t]*$)|",                       // 10
-            r"(^[ \t]*<(div|section|article|header|footer|main|aside|figure|figcaption)\b[^>]*>)" // 11
+            r"(^[ \t]*`{3,}[a-zA-Z0-9-]*[ \t]*$)|",                    // 10
+            r"(^[ \t]*<(div|section|article|header|footer|main|aside|figure|figcaption)\b[^>]*>)|", // 11
+            r"(^[ \t]*\[本轮工具调用摘要:\])"                          // 13
         )).unwrap();
     }
 
@@ -442,6 +492,8 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                 BlockType::Style
             } else if caps.get(10).is_some() {
                 BlockType::CodeFence
+            } else if caps.get(13).is_some() {
+                BlockType::ToolCallSummary
             } else {
                 container_tag = caps.get(12).unwrap().as_str().to_lowercase();
                 BlockType::HtmlContainer
@@ -451,6 +503,7 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
             let content_start = end_idx;
             let search_area = &remaining[content_start..];
 
+            let start_marker_text = &remaining[start_idx..end_idx];
             let (end_marker_start, end_marker_end, is_complete) = match block_type {
                 BlockType::Tool => TOOL_END.find(search_area).map_or((None, None, false), |m| {
                     (Some(m.start()), Some(m.end()), true)
@@ -475,11 +528,12 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                     .map_or((None, None, false), |m| {
                         (Some(m.start()), Some(m.end()), true)
                     }),
-                BlockType::HtmlFence => HTML_FENCE_END
+                BlockType::ToolCallSummary => TOOL_CALL_SUMMARY_END
                     .find(search_area)
                     .map_or((None, None, false), |m| {
                         (Some(m.start()), Some(m.end()), true)
                     }),
+                BlockType::HtmlFence => find_matching_fence_end(search_area, start_marker_text),
                 BlockType::HtmlDoc => HTML_DOC_END
                     .find(search_area)
                     .map_or((None, None, false), |m| {
@@ -495,11 +549,7 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                     .map_or((None, None, false), |m| {
                         (Some(m.start()), Some(m.end()), true)
                     }),
-                BlockType::CodeFence => GENERIC_CODE_FENCE_END
-                    .find(search_area)
-                    .map_or((None, None, false), |m| {
-                        (Some(m.start()), Some(m.end()), true)
-                    }),
+                BlockType::CodeFence => find_matching_fence_end(search_area, start_marker_text),
             };
 
             // 容错处理：未闭合的块（流式中断）降级为普通 Markdown
@@ -578,6 +628,10 @@ pub fn parse_content(raw_text: &str) -> Vec<ContentBlock> {
                     let (maid, date, content) = extract_diary_details(inner_content);
                     let nodes = crate::vcp_modules::pre_renderer::parse_markdown_to_ast(&content);
                     ContentBlock::diary(maid, date, content, Some(nodes))
+                }
+                BlockType::ToolCallSummary => {
+                    let items = parse_tool_call_summary(inner_content);
+                    ContentBlock::tool_call_summary(items, inner_content.to_string())
                 }
                 BlockType::HtmlFence => ContentBlock::html_preview(inner_content.to_string()),
                 BlockType::HtmlDoc => {
@@ -823,6 +877,63 @@ fn parse_tool_result(content: &str) -> (String, String, Vec<ToolResultDetail>, S
     (tool_name, status, details, footer)
 }
 
+pub(crate) fn parse_tool_call_summary(content: &str) -> Vec<ToolCallSummaryItem> {
+    let mut items = Vec::new();
+    for entry in content.split(['；', ';', '。']) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        let status = if entry.contains("拒绝")
+            || entry.contains("被拒")
+            || entry.contains("denied")
+            || entry.contains("rejected")
+            || entry.contains("refused")
+        {
+            "rejected"
+        } else if entry.contains("失败")
+            || entry.contains("错误")
+            || entry.contains("异常")
+            || entry.contains("error")
+            || entry.contains("failed")
+        {
+            "failure"
+        } else if entry.contains("超时") || entry.contains("timeout") {
+            "timeout"
+        } else if entry.contains("成功")
+            || entry.contains("完成")
+            || entry.contains("success")
+            || entry.contains("succeeded")
+            || entry.contains("ok")
+        {
+            "success"
+        } else if entry.contains("取消") || entry.contains("中止") || entry.contains("cancel") {
+            "cancelled"
+        } else if entry.contains("跳过") || entry.contains("skip") {
+            "skipped"
+        } else {
+            "unknown"
+        };
+
+        let tool_name = if let Some(idx) = entry.find("调用") {
+            entry[..idx].trim().to_string()
+        } else {
+            entry.to_string()
+        };
+
+        items.push(ToolCallSummaryItem {
+            tool_name,
+            status: status.to_string(),
+        });
+    }
+    items
+}
+
+pub fn is_html_tag_block(text: &str) -> bool {
+    HTML_TAG_BLOCK_RE.is_match(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,6 +958,53 @@ mod tests {
         match &blocks[0] {
             ContentBlock::Markdown { .. } => {}
             _ => panic!("Expected Markdown block, got {:?}", blocks[0]),
+        }
+    }
+
+    #[test]
+    fn test_pre_txt_16_parsing() {
+        let text = "### 16. 代码块内包含围栏\n\n````markdown\n```python\n# This is code inside markdown inside code\nprint(\"nested\")\n```\n````";
+        let blocks = parse_content(text);
+        println!("BLOCKS: {:#?}", blocks);
+        assert_eq!(blocks.len(), 2);
+
+        // 第一个块应该是 Heading
+        if let ContentBlock::Markdown { nodes, .. } = &blocks[0] {
+            let nodes = nodes.as_ref().unwrap();
+            assert_eq!(nodes.len(), 1);
+            assert!(matches!(
+                nodes[0],
+                crate::vcp_modules::pre_renderer::MarkdownNode::Heading { .. }
+            ));
+        } else {
+            panic!("Expected Heading block");
+        }
+
+        // 第二个块应该是 CodeBlock
+        if let ContentBlock::Markdown { nodes, .. } = &blocks[1] {
+            let nodes = nodes.as_ref().unwrap();
+            assert_eq!(nodes.len(), 1);
+            let has_nested_code = nodes.iter().any(|node| {
+                if let crate::vcp_modules::pre_renderer::MarkdownNode::CodeBlock {
+                    lang,
+                    code,
+                    ..
+                } = node
+                {
+                    lang.as_deref() == Some("markdown") && code.contains("```python")
+                } else {
+                    false
+                }
+            });
+            assert!(
+                has_nested_code,
+                "Expected to find a nested CodeBlock with lang=markdown and containing inner code"
+            );
+        } else {
+            panic!(
+                "Expected Markdown block with nested code, got {:?}",
+                blocks[1]
+            );
         }
     }
 }

@@ -170,12 +170,21 @@ export function useChatScroll(options: UseChatScrollOptions) {
     const target = list.querySelector(".messages-inner-container") || list;
 
     resizeObserver = new ResizeObserver(() => {
-      // 节流处理，合并单帧内的高频尺寸变动
-      if (scrollRafId) cancelAnimationFrame(scrollRafId);
-      scrollRafId = requestAnimationFrame(() => {
-        scrollRafId = null;
+      // 🌟 流式跟随状态下，或正在加载历史消息时，必须同步处理滚动，以防止 DOM 重排和滚动条设置跨帧引发的上下跳变。
+      if (scrollScene.value === "following" || scrollScene.value === "loading-top") {
+        if (scrollRafId) {
+          cancelAnimationFrame(scrollRafId);
+          scrollRafId = null;
+        }
         handleContentChange();
-      });
+      } else {
+        // 其他初始/非流式跟随场景，继续使用 RAF 节流以保证能耗和页面初载的稳定性
+        if (scrollRafId) cancelAnimationFrame(scrollRafId);
+        scrollRafId = requestAnimationFrame(() => {
+          scrollRafId = null;
+          handleContentChange();
+        });
+      }
     });
 
     resizeObserver.observe(target);
@@ -194,6 +203,17 @@ export function useChatScroll(options: UseChatScrollOptions) {
 
   // --- scroll 事件 ---
   const onScroll = () => {
+    // 🌟 修复无限置底死锁：在 scroll 触发的第一时间，同步（非节流）判定是否已向上偏离底部。
+    // 若已偏离，瞬间切入 free 状态，使紧随其后的 ResizeObserver 同步回调直接走 else 节流分支，打断强位置底。
+    const list = messageListRef.value;
+    if (list) {
+      const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 150;
+      if (!nearBottom && scrollScene.value === "following") {
+        scrollScene.value = "free";
+        showScrollToBottom.value = true;
+      }
+    }
+
     if (scrollThrottleId) return; // 已调度，节流中
     scrollThrottleId = requestAnimationFrame(() => {
       scrollThrottleId = null;
@@ -234,14 +254,62 @@ export function useChatScroll(options: UseChatScrollOptions) {
     });
   };
 
+  // --- 手势与鼠标滚轮物理置顶继续滑动判定 ---
+  let startY = 0;
+
+  const onTouchStart = (e: TouchEvent) => {
+    if (e.touches.length > 0) {
+      startY = e.touches[0].pageY;
+    }
+  };
+
+  const onTouchMove = (e: TouchEvent) => {
+    const list = messageListRef.value;
+    if (!list) return;
+
+    // 如果已经在最顶部，且用户手指继续向下拉（deltaY > 10px）
+    if (list.scrollTop <= 2 && e.touches.length > 0) {
+      const deltaY = e.touches[0].pageY - startY;
+      if (
+        deltaY > 10 &&
+        hasMoreHistory.value &&
+        !isLoadingHistory.value
+      ) {
+        prepareLoadAnchor();
+        scrollScene.value = "loading-top";
+        onLoadMore();
+      }
+    }
+  };
+
+  const onWheel = (e: WheelEvent) => {
+    const list = messageListRef.value;
+    if (!list) return;
+
+    // 如果已经在最顶部，且鼠标滚轮继续向上滚（试图拉出顶部）
+    if (list.scrollTop <= 2 && e.deltaY < 0) {
+      if (hasMoreHistory.value && !isLoadingHistory.value) {
+        prepareLoadAnchor();
+        scrollScene.value = "loading-top";
+        onLoadMore();
+      }
+    }
+  };
+
   // --- 监听 messageListRef 变化，自动设置/清理事件与 Observer ---
   const stopWatchListRef = watch(messageListRef, (el, oldEl) => {
     if (oldEl) {
       oldEl.removeEventListener("scroll", onScroll);
+      oldEl.removeEventListener("touchstart", onTouchStart);
+      oldEl.removeEventListener("touchmove", onTouchMove);
+      oldEl.removeEventListener("wheel", onWheel);
     }
     if (el) {
       startContentObserver();
       el.addEventListener("scroll", onScroll, { passive: true });
+      el.addEventListener("touchstart", onTouchStart, { passive: true });
+      el.addEventListener("touchmove", onTouchMove, { passive: true });
+      el.addEventListener("wheel", onWheel, { passive: true });
       stopWatchListRef();
     }
   });
@@ -312,7 +380,11 @@ export function useChatScroll(options: UseChatScrollOptions) {
       loadMoreDebounceId = null;
     }
     if (messageListRef.value) {
-      messageListRef.value.removeEventListener("scroll", onScroll);
+      const list = messageListRef.value;
+      list.removeEventListener("scroll", onScroll);
+      list.removeEventListener("touchstart", onTouchStart);
+      list.removeEventListener("touchmove", onTouchMove);
+      list.removeEventListener("wheel", onWheel);
     }
     loadAnchor = null;
   };

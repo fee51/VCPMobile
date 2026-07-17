@@ -5,13 +5,11 @@ import type { MarkdownNode, InlineNode } from "../types/chat";
 const htmlCache = new Map<string, string>();
 const MAX_CACHE_SIZE = 500;
 
-function getCacheKey(nodes: MarkdownNode[], messageId: string, blockHash?: string | number): string {
+function getCacheKey(messageId: string, blockHash?: string | number): string | null {
   if (blockHash !== undefined && blockHash !== null) {
     return `${messageId}:${String(blockHash)}`;
   }
-  // Fallback: If no hash provided, use a simple pointer-based or length-based key
-  // since we now expect backend to provide hashes for all production data.
-  return `${messageId}:len-${nodes.length}`;
+  return null;
 }
 
 /** 清理 AST HTML 缓存，用于重建/同步后强制重新渲染 */
@@ -36,11 +34,17 @@ export function renderMarkdownNodes(
   blockHash?: string | number
 ): string {
   if (!nodes || nodes.length === 0) return '';
-  const key = getCacheKey(nodes, messageId, blockHash);
-  const cached = htmlCache.get(key);
-  if (cached !== undefined) return cached;
+  const key = getCacheKey(messageId, blockHash);
+
+  if (key) {
+    const cached = htmlCache.get(key);
+    if (cached !== undefined) return cached;
+  }
 
   const html = nodes.map(node => renderNode(node, messageId)).join('');
+
+  // 无 hash 时不缓存，避免不同内容但节点数量相同的 legacy AST 串用 HTML
+  if (!key) return html;
 
   // 简单的 LRU 保护：超限时清空（实际命中模式是批量命中/失效）
   if (htmlCache.size >= MAX_CACHE_SIZE) {
@@ -60,6 +64,9 @@ function renderNode(node: MarkdownNode, messageId: string): string {
       return `<h${level}>${(node.children || []).map(renderInline).join('')}</h${level}>`;
     
     case 'code_block': {
+      if (node.lang === 'mermaid') {
+        return `<div class="mermaid-placeholder">${escapeHtml(node.code || '')}</div>`;
+      }
       let html = node.highlighted_html;
       if (html) {
         // 兼容旧 AST：如果 highlighted_html 是 <pre><code> 包裹内层 <pre> 的嵌套结构，提取单层
@@ -96,8 +103,7 @@ function renderNode(node: MarkdownNode, messageId: string): string {
     case 'thematic_break':
       return '<hr/>';
     
-    case 'mermaid':
-      return `<div class="mermaid-placeholder">${escapeHtml(node.code || '')}</div>`;
+
     
     case 'raw_html':
       return node.content || '';
@@ -138,10 +144,7 @@ function renderInline(node: InlineNode): string {
       return `<img src="${src}" alt="${escapeHtml(node.alt || '')}" title="${escapeHtml(node.title || '')}" loading="lazy" class="vcp-markdown-image" />`;
     }
     
-    case 'line_break':
-      return '<br/>';
-    
-    case 'soft_break':
+    case 'break':
       return '<br/>';
     
     case 'inline_math': {
@@ -151,15 +154,14 @@ function renderInline(node: InlineNode): string {
       return `<${tag} class="${cls}" data-latex="${escapeHtml(node.content || '')}">${escapeHtml(node.content || '')}</${tag}>`;
     }
     
-    case 'quoted_text':
-      const innerQuote = (node.children || []).map(renderInline).join('');
-      return `<span class="highlighted-quote">${innerQuote}</span>`;
-    
-    case 'highlight_tag':
-      return `<span class="highlighted-tag">${escapeHtml(node.value || '')}</span>`;
-    
-    case 'alert_tag':
-      return `<span class="highlighted-alert-tag">${escapeHtml(node.value || '')}</span>`;
+    case 'vcp_custom': {
+      const cls = `vcp-custom-${node.kind}`;
+      if (node.children && node.children.length > 0) {
+        const innerContent = (node.children || []).map(renderInline).join('');
+        return `<span class="${cls}">${innerContent}</span>`;
+      }
+      return `<span class="${cls}">${escapeHtml(node.value || '')}</span>`;
+    }
     
     case 'raw_html_inline':
       return node.content || '';

@@ -5,6 +5,7 @@ use crate::vcp_modules::sync_hash::HashInitializer;
 use crate::vcp_modules::sync_logger::{LogLevel, SyncLogger};
 use crate::vcp_modules::sync_pipeline::{Phase1Metadata, Phase3Message, SyncPipeline};
 use crate::vcp_modules::sync_types::SyncDataType;
+use crate::vcp_modules::vcp_log_service::get_vcp_log_status_internal;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -206,6 +207,142 @@ pub fn init_sync_service(_app_handle: AppHandle) -> SyncState {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnectionErrorDiagnosis {
+    pub error_code: String,
+    pub error_message: String,
+    pub solution: String,
+    pub error_detail: String,
+}
+
+fn check_loopback_on_mobile(ws_url: &str, is_android: bool) -> bool {
+    if is_android {
+        if let Ok(u) = url::Url::parse(ws_url) {
+            if let Some(host) = u.host_str() {
+                if host == "127.0.0.1" || host == "localhost" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+async fn diagnose_connection_failure(
+    _ws_url: &str,
+    http_url: &str,
+    err: &tokio_tungstenite::tungstenite::error::Error,
+) -> ConnectionErrorDiagnosis {
+    let err_detail = err.to_string();
+
+    // 如果系统已经明确报告地址/网络不可达，直接返回 NETWORK_UNREACHABLE，
+    // 避免依赖外部网络状态的 HTTP 探测导致误判（也消除相关单元测试的脆弱性）。
+    if let tokio_tungstenite::tungstenite::error::Error::Io(io_err) = err {
+        if matches!(
+            io_err.kind(),
+            std::io::ErrorKind::AddrNotAvailable
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::HostUnreachable
+        ) {
+            return ConnectionErrorDiagnosis {
+                error_code: "NETWORK_UNREACHABLE".to_string(),
+                error_message: "网络不可达或地址无效".to_string(),
+                solution: "无法建立连接。请检查手机网络状态，确保 WiFi 已连接且配置了正确的电脑端局域网 IP 和端口。"
+                    .to_string(),
+                error_detail: err_detail.clone(),
+            };
+        }
+    }
+
+    let is_android = cfg!(target_os = "android");
+    if check_loopback_on_mobile(_ws_url, is_android) {
+        return ConnectionErrorDiagnosis {
+            error_code: "CONFIG_LOOPBACK_ON_MOBILE".to_string(),
+            error_message: "移动端配置了本地回环地址".to_string(),
+            solution: "移动设备无法通过 127.0.0.1 或 localhost 访问电脑端的服务。请确认电脑与手机连接在同一个 WiFi 下，并在移动端设置中将同步 IP 改为电脑的局域网 IP（例如：192.168.1.100）。".to_string(),
+            error_detail: err_detail.clone(),
+        };
+    }
+
+    if let tokio_tungstenite::tungstenite::error::Error::Http(response) = err {
+        let status = response.status();
+        if status == 401 || status == 403 {
+            return ConnectionErrorDiagnosis {
+                error_code: "TOKEN_MISMATCH".to_string(),
+                error_message: "身份认证失败（Token 错误）".to_string(),
+                solution: "移动端设置的同步令牌与桌面端不匹配。请检查移动端设置中的『同步令牌』是否与电脑端 VCPMobileSync 插件的 config.env 中的 SYNC_TOKEN 完全一致。".to_string(),
+                error_detail: format!("HTTP Status: {}, Details: {}", status, err_detail),
+            };
+        } else if status == 404 {
+            return ConnectionErrorDiagnosis {
+                error_code: "WS_PATH_INVALID".to_string(),
+                error_message: "同步服务路径不存在 (404)".to_string(),
+                solution: "已成功连上服务器，但同步服务路径未被识别。请确保电脑端 VCPToolBox / VCPChat 已经启用且已加载移动端同步插件 (VCPMobileSync)，或检查同步 IP 和端口配置。".to_string(),
+                error_detail: err_detail.clone(),
+            };
+        } else {
+            return ConnectionErrorDiagnosis {
+                error_code: "HTTP_HANDSHAKE_REJECTED".to_string(),
+                error_message: format!("握手被服务器拒绝 (HTTP {})", status.as_u16()),
+                solution: "握手请求被服务器拒绝。请检查服务器状态、端口配置或尝试重启电脑端服务。"
+                    .to_string(),
+                error_detail: err_detail.clone(),
+            };
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+
+    match client.get(http_url).send().await {
+        Ok(res) => {
+            let status = res.status();
+            if status.is_success() || status.as_u16() == 401 || status.as_u16() == 403 {
+                ConnectionErrorDiagnosis {
+                    error_code: "WS_UPGRADE_FAILED".to_string(),
+                    error_message: "HTTP 访问正常，但 WebSocket 升级失败".to_string(),
+                    solution: "网络通路正常，但无法建立 WebSocket 通道。可能是桌面端的同步插件（VCPMobileSync）未正常启动，或者代理软件/VPN 拦截了 WebSocket 握手协议，请关闭 VPN 或在电脑端控制台查看 VCPMobileSync 日志。".to_string(),
+                    error_detail: format!("HTTP Status: {}, WS Err: {}", status, err_detail),
+                }
+            } else {
+                ConnectionErrorDiagnosis {
+                    error_code: "HTTP_PROBE_ERROR".to_string(),
+                    error_message: format!("HTTP 探测返回异常 (HTTP {})", status.as_u16()),
+                    solution: "已连上服务器 IP 和端口，但 HTTP 请求返回异常。请确认桌面端服务运行正常并加载了正确的同步插件。".to_string(),
+                    error_detail: format!("HTTP Status: {}, WS Err: {}", status, err_detail),
+                }
+            }
+        }
+        Err(req_err) => {
+            let req_err_str = req_err.to_string();
+            if req_err.is_timeout() {
+                ConnectionErrorDiagnosis {
+                    error_code: "NETWORK_TIMEOUT".to_string(),
+                    error_message: "连接超时，无法访问服务器".to_string(),
+                    solution: "网络请求超时。请确保：1. 电脑和手机连接在同一个 WiFi 下；2. 电脑没有开启可能会拦截局域网访问的防火墙或安全软件；3. 电脑的 IP 没有改变，与设置中的同步 IP 一致。".to_string(),
+                    error_detail: format!("WS Err: {} | HTTP Probe Err: {}", err_detail, req_err_str),
+                }
+            } else if req_err.is_connect() {
+                ConnectionErrorDiagnosis {
+                    error_code: "CONNECTION_REFUSED".to_string(),
+                    error_message: "连接被拒绝 (Connection Refused)".to_string(),
+                    solution: "服务器主动拒绝了连接。请确保：1. 电脑上的 VCPToolBox / VCPChat 已经启动；2. 桌面端的移动端同步服务已经启用并且端口配置正确。".to_string(),
+                    error_detail: format!("WS Err: {} | HTTP Probe Err: {}", err_detail, req_err_str),
+                }
+            } else {
+                ConnectionErrorDiagnosis {
+                    error_code: "NETWORK_UNREACHABLE".to_string(),
+                    error_message: "网络不可达或地址无效".to_string(),
+                    solution: "无法建立连接。请检查手机网络状态，确保 WiFi 已连接且配置了正确的电脑端局域网 IP 和端口。".to_string(),
+                    error_detail: format!("WS Err: {} | HTTP Probe Err: {}", err_detail, req_err_str),
+                }
+            }
+        }
+    }
+}
+
 async fn run_sync_session(
     app_handle: AppHandle,
     tx: mpsc::UnboundedSender<SyncCommand>,
@@ -216,12 +353,15 @@ async fn run_sync_session(
     let tx_internal = tx.clone();
     let connection_status_for_task = connection_status.clone();
 
-    let initial_settings =
-        crate::vcp_modules::settings_manager::read_settings(handle_clone.clone(), handle_clone.state())
-            .await
-            .unwrap_or_default();
+    let initial_settings = crate::vcp_modules::settings_manager::read_settings(
+        handle_clone.clone(),
+        handle_clone.state(),
+    )
+    .await
+    .unwrap_or_default();
     let mut default_headers = reqwest::header::HeaderMap::new();
-    if let Ok(device_id) = reqwest::header::HeaderValue::from_str(&initial_settings.sync_device_id) {
+    if let Ok(device_id) = reqwest::header::HeaderValue::from_str(&initial_settings.sync_device_id)
+    {
         default_headers.insert("x-device-id", device_id);
     }
     let http_client = reqwest::Client::builder()
@@ -381,29 +521,37 @@ async fn run_sync_session(
                         .await;
                     emit_sync_log(&handle_clone, "info", "正在验证桌面端插件版本...");
 
-                    let version_ok = tokio::time::timeout(VERSION_CHECK_TIMEOUT, async {
-                        while let Some(Ok(msg)) = ws_stream.next().await {
-                            if let Message::Text(text) = msg {
-                                if let Ok(payload) = serde_json::from_str::<Value>(&text) {
-                                    if payload.get("type").and_then(|v| v.as_str())
-                                        == Some("VERSION_ACK")
-                                    {
-                                        return payload
-                                            .get("version")
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string());
+                    let version_result = tokio::time::timeout(VERSION_CHECK_TIMEOUT, async {
+                        while let Some(res) = ws_stream.next().await {
+                            match res {
+                                Ok(Message::Text(text)) => {
+                                    if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+                                        if payload.get("type").and_then(|v| v.as_str())
+                                            == Some("VERSION_ACK")
+                                        {
+                                            if let Some(v) =
+                                                payload.get("version").and_then(|v| v.as_str())
+                                            {
+                                                return Ok(v.to_string());
+                                            }
+                                        }
                                     }
                                 }
+                                Ok(Message::Close(close_frame)) => {
+                                    return Err(close_frame);
+                                }
+                                Err(_) => {
+                                    return Err(None);
+                                }
+                                _ => {}
                             }
                         }
-                        None
+                        Err(None)
                     })
-                    .await
-                    .ok()
-                    .flatten();
+                    .await;
 
-                    match version_ok {
-                        Some(plugin_version) => {
+                    match version_result {
+                        Ok(Ok(plugin_version)) => {
                             if plugin_version == EXPECTED_PLUGIN_VERSION {
                                 emit_sync_log(
                                     &handle_clone,
@@ -421,16 +569,88 @@ async fn run_sync_session(
                                     ),
                                 )
                                 .await;
-                                emit_sync_log(&handle_clone, "error", "请前往 https://github.com/fee51/VCPMobile/releases 下载最新同步插件");
+                                emit_sync_log(
+                                    &handle_clone,
+                                    "error",
+                                    &format!(
+                                        "❌ 插件版本不匹配: 桌面端版本 v{}，期望版本 v{}",
+                                        plugin_version, EXPECTED_PLUGIN_VERSION
+                                    ),
+                                );
+                                emit_sync_log(&handle_clone, "error", "👉 排查建议: 请前往 https://github.com/fee51/VCPMobile/releases 下载最新同步插件");
                                 break;
                             }
                         }
-                        None => {
+                        Ok(Err(Some(frame))) => {
+                            let code: u16 = frame.code.into();
+                            let reason = &frame.reason;
+                            if code == 4001 {
+                                emit_sync_log(
+                                    &handle_clone,
+                                    "error",
+                                    "❌ 同步连接失败 [TOKEN_MISMATCH]: 身份认证失败（Token 错误）",
+                                );
+                                emit_sync_log(&handle_clone, "error", "👉 排查建议: 移动端设置的同步令牌与桌面端不匹配。请检查移动端设置中的『同步令牌』是否与电脑端 VCPMobileSync 插件的 config.env 中的 SYNC_TOKEN 完全一致。");
+                                publish_sync_status(
+                                    &handle_clone,
+                                    &connection_status_for_task,
+                                    "error",
+                                    "身份认证失败（Token 错误）",
+                                )
+                                .await;
+                            } else {
+                                let err_msg = format!(
+                                    "连接被服务器关闭 (code: {}, reason: {})",
+                                    code, reason
+                                );
+                                emit_sync_log(
+                                    &handle_clone,
+                                    "error",
+                                    &format!("❌ 同步连接失败 [WS_CLOSED]: {}", err_msg),
+                                );
+                                emit_sync_log(
+                                    &handle_clone,
+                                    "error",
+                                    "👉 排查建议: 请检查桌面端控制台日志以获取详细关闭原因。",
+                                );
+                                publish_sync_status(
+                                    &handle_clone,
+                                    &connection_status_for_task,
+                                    "error",
+                                    &err_msg,
+                                )
+                                .await;
+                            }
+                            break;
+                        }
+                        Ok(Err(None)) => {
+                            emit_sync_log(
+                                &handle_clone,
+                                "error",
+                                "❌ 同步连接失败 [CONNECTION_CLOSED]: 连接在版本验证前被意外关闭",
+                            );
+                            emit_sync_log(&handle_clone, "error", "👉 排查建议: 请确认桌面端服务正常运行，且同步 Token 与网络无异常。");
                             publish_sync_status(
                                 &handle_clone,
                                 &connection_status_for_task,
                                 "error",
-                                "版本验证超时，桌面端插件可能过旧或不支持版本校验",
+                                "连接被意外关闭",
+                            )
+                            .await;
+                            break;
+                        }
+                        Err(_) => {
+                            emit_sync_log(
+                                &handle_clone,
+                                "error",
+                                "❌ 同步连接失败 [VERSION_CHECK_TIMEOUT]: 版本验证超时",
+                            );
+                            emit_sync_log(&handle_clone, "error", "👉 排查建议: 桌面端服务响应缓慢，或者当前网络异常。请检查局域网连接，或尝试重启电脑端服务。");
+                            publish_sync_status(
+                                &handle_clone,
+                                &connection_status_for_task,
+                                "error",
+                                "版本验证超时",
                             )
                             .await;
                             break;
@@ -549,9 +769,16 @@ async fn run_sync_session(
                 let manifest_phase = Arc::new(AtomicU8::new(1));
                 let mut sync_cycle_active = false;
                 let mut sync_cycle_pending = false;
+                let mut fatal_error = false;
+                let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(15));
 
                 loop {
                     tokio::select! {
+                        _ = heartbeat_interval.tick() => {
+                            if let Err(e) = ws_stream.send(Message::Ping(vec![].into())).await {
+                                log::warn!("[SyncService] Failed to send WebSocket Ping: {}", e);
+                            }
+                        }
                         Some(cmd) = pipeline_rx.recv() => {
                             match cmd {
                                 crate::vcp_modules::sync_pipeline::pipeline::PipelineCommand::StartTopicMetadata => {
@@ -868,7 +1095,8 @@ async fn run_sync_session(
                         res = ws_stream.next() => {
                             match res {
                                 Some(Ok(msg)) => {
-                                    if let Message::Text(text) = msg {
+                                    match msg {
+                                        Message::Text(text) => {
                                 let payload: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                                 if payload.is_null() { continue; }
 
@@ -1042,9 +1270,31 @@ async fn run_sync_session(
                                         emit_sync_log(&handle_clone, "info", &msg);
                                     },
                                         _ => {}
+                                    }
                                 }
+                                Message::Close(close_frame) => {
+                                    let mut err_msg = "WebSocket 连接被关闭".to_string();
+                                    let mut error_code = "WS_CLOSED".to_string();
+                                    let mut solution = "连接已被服务器关闭，请在桌面端控制台查看详细日志。".to_string();
+                                    if let Some(frame) = &close_frame {
+                                        let code: u16 = frame.code.into();
+                                        let reason = &frame.reason;
+                                        err_msg = format!("WebSocket 连接被服务器关闭 (code: {}, reason: {})", code, reason);
+                                        if code == 4001 {
+                                            error_code = "TOKEN_MISMATCH".to_string();
+                                            err_msg = "身份认证失败（Token 错误）".to_string();
+                                            solution = "移动端设置的同步令牌与桌面端不匹配。请检查移动端设置中的『同步令牌』是否与电脑端 VCPMobileSync 插件的 config.env 中的 SYNC_TOKEN 完全一致。".to_string();
+                                            fatal_error = true;
+                                        }
+                                    }
+                                    emit_sync_log(&handle_clone, "error", &format!("❌ 同步连接失败 [{}]: {}", error_code, err_msg));
+                                    emit_sync_log(&handle_clone, "error", &format!("👉 排查建议: {}", solution));
+                                    publish_sync_status(&handle_clone, &connection_status_for_task, "error", &err_msg).await;
+                                    break;
+                                }
+                                _ => {}
                             }
-                                }
+                        }
                                 Some(Err(e)) => {
                                     let err_msg = format!("WebSocket 接收发生错误: {}", e);
                                     if let Ok(mut logger) = sync_logger_task.lock() {
@@ -1073,6 +1323,9 @@ async fn run_sync_session(
                 {
                     break; // 同步完成，退出外层 loop
                 } else {
+                    if fatal_error {
+                        break;
+                    }
                     // 同步未成功完成，但内层循环已跳出（说明中途断网）
                     retry_count += 1;
                     let backoff = Duration::from_secs((1u64 << retry_count.min(5)).min(30));
@@ -1100,13 +1353,50 @@ async fn run_sync_session(
                 }
             }
             Err(e) => {
-                let err_detail = e.to_string();
-                retry_count += 1;
+                let diagnosis = diagnose_connection_failure(&ws_url, &http_url, &e).await;
+                let is_fatal = diagnosis.error_code == "CONFIG_LOOPBACK_ON_MOBILE"
+                    || diagnosis.error_code == "TOKEN_MISMATCH"
+                    || diagnosis.error_code == "WS_PATH_INVALID";
+
+                if is_fatal {
+                    emit_sync_log(
+                        &handle_clone,
+                        "error",
+                        &format!(
+                            "❌ 同步连接失败 [{}]: {}",
+                            diagnosis.error_code, diagnosis.error_message
+                        ),
+                    );
+                    emit_sync_log(
+                        &handle_clone,
+                        "error",
+                        &format!("👉 排查建议: {}", diagnosis.solution),
+                    );
+                    emit_sync_log(
+                        &handle_clone,
+                        "error",
+                        &format!("🔍 调试细节: {}", diagnosis.error_detail),
+                    );
+
+                    publish_sync_status(
+                        &handle_clone,
+                        &connection_status_for_task,
+                        "error",
+                        &format!("同步连接失败: {}", diagnosis.error_message),
+                    )
+                    .await;
+                    break;
+                }
+
                 let warn_msg = format!(
-                    "连接失败，将持续自动重试 (第 {} 次) | {}",
-                    retry_count, err_detail
+                    "连接失败，将持续自动重试 (第 {} 次) | {} ({})",
+                    retry_count + 1,
+                    diagnosis.error_message,
+                    diagnosis.error_code
                 );
                 emit_sync_log(&handle_clone, "warning", &warn_msg);
+
+                retry_count += 1;
                 if !handle_clone
                     .state::<SyncState>()
                     .is_syncing
@@ -1242,10 +1532,7 @@ pub async fn start_manual_sync(
     handle: AppHandle,
     state: State<'_, SyncState>,
 ) -> Result<(), String> {
-    if state
-        .is_syncing
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
+    if state.is_syncing.load(std::sync::atomic::Ordering::SeqCst) {
         state.send_sync_command(SyncCommand::StartManualSync);
         return Ok(());
     }
@@ -1255,6 +1542,15 @@ pub async fn start_manual_sync(
         .swap(true, std::sync::atomic::Ordering::SeqCst)
     {
         return Err("同步已在进行中".to_string());
+    }
+
+    // VCPLog 是全局重要通道，未连接时直接拦截同步，避免进入同步主循环后长时间挂起
+    let log_status = get_vcp_log_status_internal().await;
+    if log_status != "connected" {
+        state
+            .is_syncing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        return Err("VCPLog 未连接，请先建立 VCPLog 连接后再进行同步".to_string());
     }
 
     let (tx, rx) = mpsc::unbounded_channel::<SyncCommand>();
@@ -1389,4 +1685,117 @@ pub async fn clear_old_sync_logs(app: AppHandle, keep_days: u32) -> Result<u32, 
     }
 
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::error::Error as WsError;
+    use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
+
+    #[test]
+    fn test_check_loopback_on_mobile() {
+        // Test Android mode (is_android = true)
+        assert!(check_loopback_on_mobile("ws://127.0.0.1:3000", true));
+        assert!(check_loopback_on_mobile(
+            "ws://localhost:8080/ws-sync",
+            true
+        ));
+        assert!(!check_loopback_on_mobile("ws://192.168.1.100:3000", true));
+        assert!(!check_loopback_on_mobile("ws://my-pc.local:3000", true));
+
+        // Test non-Android mode (is_android = false)
+        assert!(!check_loopback_on_mobile("ws://127.0.0.1:3000", false));
+        assert!(!check_loopback_on_mobile(
+            "ws://localhost:8080/ws-sync",
+            false
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_unauthorized_token() {
+        // Create an HTTP Error with status 401
+        let response = Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(None)
+            .unwrap();
+        let err = WsError::Http(response);
+
+        let diagnosis = diagnose_connection_failure(
+            "ws://192.168.1.100:3000/ws-sync",
+            "http://192.168.1.100:3000",
+            &err,
+        )
+        .await;
+
+        assert_eq!(diagnosis.error_code, "TOKEN_MISMATCH");
+        assert!(diagnosis.error_message.contains("身份认证失败"));
+        assert!(diagnosis.solution.contains("同步令牌"));
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_not_found_path() {
+        // Create an HTTP Error with status 404
+        let response = Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(None)
+            .unwrap();
+        let err = WsError::Http(response);
+
+        let diagnosis = diagnose_connection_failure(
+            "ws://192.168.1.100:3000/ws-sync",
+            "http://192.168.1.100:3000",
+            &err,
+        )
+        .await;
+
+        assert_eq!(diagnosis.error_code, "WS_PATH_INVALID");
+        assert!(diagnosis.error_message.contains("路径不存在"));
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_connection_refused() {
+        // Simulate a connection refused error on localhost on port 1.
+        let io_err =
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let err = WsError::Io(io_err);
+
+        let diagnosis =
+            diagnose_connection_failure("ws://127.0.0.1:1/ws-sync", "http://127.0.0.1:1", &err)
+                .await;
+
+        assert!(
+            diagnosis.error_code == "CONNECTION_REFUSED"
+                || diagnosis.error_code == "NETWORK_TIMEOUT"
+        );
+        assert!(
+            diagnosis.error_message.contains("连接被拒绝")
+                || diagnosis.error_message.contains("连接超时")
+        );
+        assert!(diagnosis.solution.contains("启动") || diagnosis.solution.contains("同一个 WiFi"));
+    }
+
+    #[tokio::test]
+    async fn test_diagnose_network_unreachable() {
+        // Simulate an unreachable address error.
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "address not available",
+        );
+        let err = WsError::Io(io_err);
+
+        let diagnosis = diagnose_connection_failure(
+            "ws://non-existent-domain-vcp-test.xyz/ws-sync",
+            "http://non-existent-domain-vcp-test.xyz",
+            &err,
+        )
+        .await;
+
+        assert_eq!(diagnosis.error_code, "NETWORK_UNREACHABLE");
+        assert!(
+            diagnosis.error_message.contains("网络不可达")
+                || diagnosis.error_message.contains("地址无效")
+        );
+        assert!(diagnosis.solution.contains("网络状态"));
+    }
 }

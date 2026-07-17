@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, watch, onUnmounted } from "vue";
 import { useAssistantStore, type AgentConfig } from "../../../core/stores/assistant";
+import { useModalHistory } from "../../../core/composables/useModalHistory";
 import VcpAvatar from "../../../components/ui/VcpAvatar.vue";
 
 const props = defineProps<{
@@ -15,6 +16,8 @@ const emit = defineEmits<{
 }>();
 
 const assistantStore = useAssistantStore();
+const { registerModal, unregisterModal } = useModalHistory();
+const modalId = "ShareAgentSelector";
 
 const availableAgents = computed(() => assistantStore.agents);
 
@@ -28,6 +31,24 @@ const previewText = computed(() => {
 const handleSelect = (agent: AgentConfig) => {
   emit("selected", agent);
 };
+
+watch(
+  () => props.isOpen,
+  (newVal) => {
+    if (newVal) {
+      registerModal(modalId, () => {
+        emit("close");
+      });
+    } else {
+      unregisterModal(modalId);
+    }
+  },
+  { immediate: true }
+);
+
+onUnmounted(() => {
+  unregisterModal(modalId);
+});
 </script>
 
 <template>
@@ -47,7 +68,7 @@ const handleSelect = (agent: AgentConfig) => {
       <div
         v-if="isOpen"
         class="fixed bottom-0 left-0 right-0 z-sheet bg-white/95 dark:bg-zinc-900/95 backdrop-blur-xl rounded-t-[1.8rem] shadow-2xl p-5 flex flex-col border-t border-white/20 dark:border-white/5"
-        :style="{ paddingBottom: 'calc(env(safe-area-inset-bottom, 20px) + 12px)' }"
+        :style="{ paddingBottom: 'calc(var(--vcp-safe-bottom, 48px) + 12px)' }"
       >
         <!-- 拖手线 -->
         <div class="w-10 h-1 bg-black/10 dark:bg-white/15 rounded-full mx-auto mb-4"></div>

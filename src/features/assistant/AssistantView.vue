@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// [SUSPENDED BETA] 浮动助手窗口当前已暂停使用，SettingsView.vue 中的入口已关闭。
 import { ref, onMounted, nextTick, watch } from "vue";
 import { useFloatingAssistantStore } from "../../core/stores/floatingAssistant";
 import AssistantMessageCard from "./AssistantMessageCard.vue";
@@ -180,7 +181,8 @@ onMounted(() => {
 
     <!-- Input -->
     <div
-      class="p-3 border-t border-black/5 dark:border-white/5 shrink-0 bg-white/50 dark:bg-zinc-900/50 pb-6"
+      class="p-3 border-t border-black/5 dark:border-white/5 shrink-0 bg-white/50 dark:bg-zinc-900/50"
+      :style="{ paddingBottom: 'calc(var(--vcp-safe-bottom, 48px) + 24px)' }"
     >
       <div
         class="flex items-end gap-2 bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 rounded-xl p-2 focus-within:border-blue-500 transition-colors"

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::vcp_modules::content_parser::{
-    BlockType, ToolResultDetail, BUTTON_CLICK, /* extraction helpers */
+    BlockType, ToolCallSummaryItem, ToolResultDetail, BUTTON_CLICK, /* extraction helpers */
     CONTENT_REGEX, DATE_REGEX, DIARY_END, DIARY_START, GENERIC_CODE_FENCE_END,
     GENERIC_CODE_FENCE_START, HTML_DOC_END, HTML_DOC_START, HTML_FENCE_START, KV_REGEX, MAID_REGEX,
     ROLE_DIVIDER, STYLE_TAG_END, STYLE_TAG_START, THINK_END, THINK_START, THOUGHT_END,
@@ -70,6 +70,12 @@ pub enum StreamBlock {
     Style { content: String, hash: String },
     #[serde(rename = "button-click")]
     ButtonClick { content: String, hash: String },
+    #[serde(rename = "tool-call-summary")]
+    ToolCallSummary {
+        items: Vec<ToolCallSummaryItem>,
+        raw_content: String,
+        hash: String,
+    },
 }
 
 impl StreamBlock {
@@ -153,6 +159,18 @@ impl StreamBlock {
 
     pub fn style(content: String, hash: String) -> Self {
         Self::Style { content, hash }
+    }
+
+    pub fn tool_call_summary(
+        items: Vec<ToolCallSummaryItem>,
+        raw_content: String,
+        hash: String,
+    ) -> Self {
+        Self::ToolCallSummary {
+            items,
+            raw_content,
+            hash,
+        }
     }
 
     #[allow(dead_code)]
@@ -262,7 +280,13 @@ impl StreamBlockParser {
         let (mut blocks, tail) = self.process(full_text);
         let trimmed = tail.trim();
         if !trimmed.is_empty() {
-            let nodes = crate::vcp_modules::pre_renderer::parse_markdown_to_ast(trimmed);
+            let nodes = if crate::vcp_modules::content_parser::is_html_tag_block(trimmed) {
+                vec![crate::vcp_modules::pre_renderer::MarkdownNode::raw_html(
+                    trimmed.to_string(),
+                )]
+            } else {
+                crate::vcp_modules::pre_renderer::parse_markdown_to_ast(trimmed)
+            };
             let hash = HashAggregator::compute_content_hash(trimmed);
             blocks.push(StreamBlock::markdown(
                 trimmed.to_string(),
@@ -285,7 +309,7 @@ impl StreamBlockParser {
 /// 在文本中寻找最早出现的特种块起始标记
 /// 返回 (start_offset, end_offset, BlockType)
 fn find_earliest_start_marker(text: &str) -> Option<(usize, usize, BlockType)> {
-    let checks: [(&regex::Regex, BlockType); 11] = [
+    let checks: [(&regex::Regex, BlockType); 12] = [
         (&TOOL_START, BlockType::Tool),
         (&THOUGHT_START, BlockType::Thought),
         (&THINK_START, BlockType::Think),
@@ -299,6 +323,10 @@ fn find_earliest_start_marker(text: &str) -> Option<(usize, usize, BlockType)> {
         (
             &crate::vcp_modules::content_parser::HTML_CONTAINER_OPEN_RE,
             BlockType::HtmlContainer,
+        ),
+        (
+            &crate::vcp_modules::content_parser::TOOL_CALL_SUMMARY_START,
+            BlockType::ToolCallSummary,
         ),
     ];
 
@@ -360,6 +388,9 @@ fn find_end_marker(
         BlockType::Think => THINK_END.find(search_area),
         BlockType::ToolResult => TOOL_RESULT_END.find(search_area),
         BlockType::Diary => DIARY_END.find(search_area),
+        BlockType::ToolCallSummary => {
+            crate::vcp_modules::content_parser::TOOL_CALL_SUMMARY_END.find(search_area)
+        }
         BlockType::HtmlFence | BlockType::CodeFence => GENERIC_CODE_FENCE_END.find(search_area),
         BlockType::HtmlDoc => HTML_DOC_END.find(search_area),
         BlockType::HtmlContainer => unreachable!(),
@@ -443,6 +474,11 @@ fn build_stream_block(
                 HashAggregator::compute_content_hash(&format!("{}:{}:{}", maid, date, content));
             StreamBlock::diary(maid, date, content, Some(nodes), hash)
         }
+        BlockType::ToolCallSummary => {
+            let items = crate::vcp_modules::content_parser::parse_tool_call_summary(inner_content);
+            let hash = HashAggregator::compute_content_hash(inner_content);
+            StreamBlock::tool_call_summary(items, inner_content.to_string(), hash)
+        }
         BlockType::HtmlFence | BlockType::HtmlDoc => {
             let hash = HashAggregator::compute_content_hash(inner_content);
             StreamBlock::html_preview(inner_content.to_string(), hash)
@@ -512,84 +548,32 @@ fn split_markdown_paragraphs(text: &str) -> (Vec<StreamBlock>, String) {
         return (Vec::new(), String::new());
     }
 
-    // 只有累计文本长度大于等于 800 字节时，才允许进行双换行分段沉淀
-    if text.len() >= 800 {
-        if let Some(last_break) = text.rfind("\n\n") {
-            let stable = &text[..last_break + 2];
-            let tail = &text[last_break + 2..];
+    if let Some(last_break) = text.rfind("\n\n") {
+        let stable = &text[..last_break + 2];
+        let tail = &text[last_break + 2..];
 
-            let mut blocks = Vec::new();
-            for para in stable.split("\n\n") {
-                let trimmed = para.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                // 对已闭合的 Markdown 段落进行 AST 预渲染
-                let nodes = crate::vcp_modules::pre_renderer::parse_markdown_to_ast(trimmed);
-                let hash = HashAggregator::compute_content_hash(trimmed);
-                blocks.push(StreamBlock::markdown(
-                    trimmed.to_string(),
-                    Some(nodes),
-                    hash,
-                ));
+        let mut blocks = Vec::new();
+        for para in stable.split("\n\n") {
+            let trimmed = para.trim();
+            if trimmed.is_empty() {
+                continue;
             }
-
-            // 针对留下的 tail，进行“句级”自适应切分兜底
-            let (mut extra_blocks, final_tail) = check_sentence_precipitation(tail);
-            blocks.append(&mut extra_blocks);
-
-            // 检查 inline button clicks
-            let blocks = extract_inline_buttons(blocks);
-            (blocks, final_tail)
-        } else {
-            // 全程没有 \n\n，进行句级自适应切分兜底
-            let (blocks, final_tail) = check_sentence_precipitation(text);
-            let blocks = extract_inline_buttons(blocks);
-            (blocks, final_tail)
-        }
-    } else {
-        // 累计文本小于 800 字节，不分段也不触发句级沉淀，直接以 tail 形式返回
-        (Vec::new(), text.to_string())
-    }
-}
-
-/// 辅助函数：当未分段文本超过阈值时，利用句尾标点强行截断沉淀
-fn check_sentence_precipitation(text: &str) -> (Vec<StreamBlock>, String) {
-    const PRECIPITATE_THRESHOLD: usize = 1500; // 1500字阻尼线
-
-    if text.len() < PRECIPITATE_THRESHOLD {
-        return (Vec::new(), text.to_string());
-    }
-
-    // 寻找距离最近的一个句尾标点（。 ！ ？ . ! ?）
-    let punctuations = ['。', '！', '？', '…', '.', '!', '?'];
-    let mut cut_index = None;
-
-    for (i, ch) in text.char_indices().rev() {
-        // 保留至少 800 个字节作为 stable 头部，保证打字机打出的文字有连续视效
-        if i < 800 {
-            break;
-        }
-        if punctuations.contains(&ch) {
-            cut_index = Some(i + ch.len_utf8());
-            break;
-        }
-    }
-
-    if let Some(idx) = cut_index {
-        let stable_part = &text[..idx];
-        let tail_part = &text[idx..];
-
-        let trimmed = stable_part.trim();
-        if !trimmed.is_empty() {
+            // 对已闭合的 Markdown 段落进行 AST 预渲染
             let nodes = crate::vcp_modules::pre_renderer::parse_markdown_to_ast(trimmed);
             let hash = HashAggregator::compute_content_hash(trimmed);
-            let block = StreamBlock::markdown(trimmed.to_string(), Some(nodes), hash);
-            return (vec![block], tail_part.to_string());
+            blocks.push(StreamBlock::markdown(
+                trimmed.to_string(),
+                Some(nodes),
+                hash,
+            ));
         }
-    }
 
-    (Vec::new(), text.to_string())
+        let blocks = extract_inline_buttons(blocks);
+        (blocks, tail.to_string())
+    } else {
+        // 全程没有 \n\n，直接以 tail 形式返回
+        (Vec::new(), text.to_string())
+    }
 }
 
 /// 从 Markdown 块中提取内联按钮点击
@@ -745,12 +729,11 @@ fn parse_tool_result(content: &str) -> (String, String, Vec<ToolResultDetail>, S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn test_code_block_precipitation_failure() {
-        let file_path = "g:\\VCPMobile\\scripts\\tail-test\\测试文档.txt";
-        let mut text = fs::read_to_string(file_path).expect("Failed to read test document");
+        // 真实样本 测试文档.txt（include_str! 编译期内嵌，杜绝绝对路径与 CI panic）
+        let mut text = include_str!("fixtures/测试文档.txt").to_string();
 
         // 兼容处理：如果是转义过的 JSON Payload，使用 serde_json 进行 unescape
         if text.contains("\\n") || text.contains("\\\"") {
@@ -763,45 +746,15 @@ mod tests {
             }
         }
 
-        println!("====== REGEX DIRECT MATCH DIAGNOSIS (ORIGINAL UNESCAPED TEXT) ======");
-        let fence_start_re = &crate::vcp_modules::content_parser::HTML_FENCE_START;
-        let fence_end_re = &crate::vcp_modules::content_parser::GENERIC_CODE_FENCE_END;
-
-        if let Some(m_start) = fence_start_re.find(&text) {
-            println!(
-                "HTML_FENCE_START matched at: {}..{}",
-                m_start.start(),
-                m_start.end()
-            );
-            let search_area = &text[m_start.end()..];
-            println!(
-                "Search area first 200 chars: {:?}",
-                &search_area[..200.min(search_area.len())]
-            );
-
-            if let Some(m_end) = fence_end_re.find(search_area) {
-                println!(
-                    "GENERIC_CODE_FENCE_END matched in search_area at relative: {}..{}",
-                    m_end.start(),
-                    m_end.end()
-                );
-            } else {
-                println!("GENERIC_CODE_FENCE_END FAILED TO MATCH search_area!");
-            }
-        } else {
-            println!("HTML_FENCE_START failed to match!");
-        }
-
-        // 构造包含 HtmlContainer 的测试文本
+        // 构造包含 HtmlContainer 的测试文本，验证解析器能沉淀出稳定块
         let html_container_text =
             "\n<div class=\"chat-container\">\n<p>Hello inside container</p>\n</div>\n";
         let combined_text = format!("{}{}", text, html_container_text);
 
         let mut parser = StreamBlockParser::new();
         let blocks = parser.finalize(&combined_text);
-        println!("====== RUST UNIT TEST PRECIPITATION DIAGNOSIS ======");
-        println!("Blocks count: {}", blocks.len());
 
+        // 断言：解析器应成功沉淀出至少一个稳定块
         assert!(
             !blocks.is_empty(),
             "Parser should successfully yield stable blocks"

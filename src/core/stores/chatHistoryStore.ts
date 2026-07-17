@@ -8,7 +8,7 @@ import { useAssistantStore } from "./assistant";
 import { useSettingsStore } from "./settings";
 import { useTopicStore } from "./topicListManager";
 import { clearMessageCache } from "../utils/astRenderer";
-import { acquireScreenKeep } from "../composables/useScreenKeeper";
+
 import type { ChatMessage, HistoryChunk, ContentBlock } from "../types/chat";
 
 export const useChatHistoryStore = defineStore("chatHistory", () => {
@@ -19,6 +19,10 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const historyOffset = ref(0);        // 当前已加载的消息总数（= 下次请求的 offset 起点）
   const hasMoreHistory = ref(true);    // 是否还有更多旧消息
   const isLoadingHistory = ref(false); // 防止并发重复触发
+
+  // 启动预加载缓存：PRELOADING 阶段提前拉取首屏历史，ChatView mount 后直接消费
+  const preloadedHistory = ref<{ topicId: string; messages: ChatMessage[] } | null>(null);
+  let preloadConsumed = false;
 
   // 用于拦截重新生成时的输入框补全
   const editMessageContent = ref("");
@@ -34,6 +38,28 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const assistantStore = useAssistantStore();
   const settingsStore = useSettingsStore();
   const topicStore = useTopicStore();
+
+  /**
+   * 启动预加载：在 PRELOADING 阶段提前拉取首屏聊天历史
+   * 让 DB + IPC 开销与 Vue 组件挂载并行，ChatView mount 后直接命中缓存
+   */
+  const preloadHistory = async (
+    ownerId: string,
+    ownerType: string,
+    topicId: string,
+    limit: number = 5,
+  ) => {
+    try {
+      const messages = await invoke<ChatMessage[]>('load_chat_history', {
+        ownerId, ownerType, topicId, limit, offset: 0,
+      });
+      preloadedHistory.value = { topicId, messages };
+      console.log(`[ChatHistoryStore] Preloaded ${messages.length} messages for topic ${topicId}`);
+    } catch (e) {
+      console.error('[ChatHistoryStore] Preload failed:', e);
+      preloadedHistory.value = null;
+    }
+  };
 
   /**
    * 尝试为话题生成 AI 总结标题
@@ -90,9 +116,8 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     limit: number = 15,
     offset: number = 0
   ) => {
-    const loadType = offset === 0 ? "initial" : "pagination";
     console.log(
-      `[ChatHistoryStore] Loading history [${loadType}] for ${ownerId}, topic: ${topicId}, limit: ${limit}, offset: ${offset}`,
+      `[ChatHistoryStore] Loading history for ${ownerId}, topic: ${topicId}, limit: ${limit}, offset: ${offset}`,
     );
     loading.value = true;
     isLoadingHistory.value = true;
@@ -105,48 +130,68 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     const { signal } = controller;
 
     try {
+      // Fast Path: offset=0 initial load uses batch invoke (skip Channel + RAF)
+      if (offset === 0) {
+        let messages: ChatMessage[];
+
+        // Check preloaded cache from PRELOADING phase — zero-latency if hit
+        if (!preloadConsumed && preloadedHistory.value?.topicId === topicId) {
+          messages = preloadedHistory.value.messages;
+          preloadedHistory.value = null;
+          preloadConsumed = true;
+          console.log(`[ChatHistoryStore] Using preloaded cache: ${messages.length} messages`);
+        } else {
+          // Normal invoke path
+          preloadConsumed = true;
+          messages = await invoke<ChatMessage[]>('load_chat_history', {
+            ownerId, ownerType, topicId, limit, offset,
+          });
+        }
+
+        if (signal.aborted || sessionStore.currentTopicId !== topicId) {
+          console.warn(`[ChatHistoryStore] Topic changed/aborted during batch load, discarding.`);
+          return;
+        }
+
+        // Object hydration: prefer reactive proxy from active streams
+        const hydrated = messages.map(msg =>
+          streamStore.activeStreamMessages.get(msg.id) || msg,
+        );
+
+        currentChatHistory.value = hydrated;
+        historyOffset.value = hydrated.length;
+        hasMoreHistory.value = hydrated.length >= limit;
+
+        // Resolve attachment paths (sync, no IPC)
+        hydrated.forEach(msg => attachmentStore.resolveMessageAssets(msg));
+
+        console.log(`[ChatHistoryStore] Loaded ${hydrated.length} messages [initial]`);
+        return;
+      }
+
+      // Channel Path: pagination (offset > 0) streaming logic unchanged
       const channel = new Channel<HistoryChunk>();
       const buffer: ChatMessage[] = [];
-      let receivedCount = 0;
       let resolveComplete: (() => void) | null = null;
       const completePromise = new Promise<void>((resolve) => { resolveComplete = resolve; });
 
       channel.onmessage = (chunk) => {
-        // 1. 唯一性与话题一致性防御性校验：若请求已中止，或当前话题已被切换，直接丢弃该过时流数据
+        // 唯一性与话题一致性防御性校验
         if (signal.aborted || sessionStore.currentTopicId !== topicId) {
           return;
         }
 
-        // 2. [关键修复] 消息对象劫持 (Object Hydration)
-        // 如果该消息正在活跃生成中，则从全局流池中取出“活的”响应式对象
-        // 这确保了即使是刚从 DB 拉回来的骨架，也能瞬间恢复流式动画与渲染状态
+        // 对象劫持 (Object Hydration)：活跃流中的响应式对象优先
         const activeMsg = streamStore.activeStreamMessages.get(chunk.message.id);
         const msgToUse = activeMsg || chunk.message;
 
-        if (offset === 0) {
-          if (chunk.index === 0) {
-            currentChatHistory.value = [];
-            hasMoreHistory.value = true;
-          }
-          currentChatHistory.value.push(msgToUse);
-          receivedCount++;
-        } else {
-          buffer.push(msgToUse);
-          receivedCount++;
-        }
+        buffer.push(msgToUse);
 
         if (chunk.is_last) {
-          if (offset > 0) {
-            currentChatHistory.value = [...buffer, ...currentChatHistory.value];
-            historyOffset.value += buffer.length;
-            if (buffer.length < limit) {
-              hasMoreHistory.value = false;
-            }
-          } else {
-            historyOffset.value = receivedCount;
-            if (receivedCount < limit) {
-              hasMoreHistory.value = false;
-            }
+          currentChatHistory.value = [...buffer, ...currentChatHistory.value];
+          historyOffset.value += buffer.length;
+          if (buffer.length < limit) {
+            hasMoreHistory.value = false;
           }
           resolveComplete?.();
         }
@@ -162,32 +207,22 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       });
 
       if (total === 0) {
-        if (offset === 0) {
-          currentChatHistory.value = [];
-          historyOffset.value = 0;
-        }
         hasMoreHistory.value = false;
         (resolveComplete as (() => void) | null)?.();
       }
 
       await completePromise;
 
-      const loadedCount = offset === 0 ? total : buffer.length;
       console.log(
-        `[ChatHistoryStore] Loaded ${loadedCount} messages [${loadType}] for ${ownerId}, topic: ${topicId}`,
+        `[ChatHistoryStore] Loaded ${buffer.length} messages [pagination] for ${ownerId}, topic: ${topicId}`,
       );
 
       if (signal.aborted || sessionStore.currentTopicId !== topicId) {
-        console.warn(`[ChatHistoryStore] Topic changed or request aborted during load, discarding results.`);
+        console.warn(`[ChatHistoryStore] Topic changed or request aborted during pagination, discarding.`);
         return;
       }
 
-      const messagesToResolve = offset === 0 ? currentChatHistory.value : buffer;
-      await Promise.all(
-        messagesToResolve.map(async (msg) => {
-          attachmentStore.resolveMessageAssets(msg);
-        }),
-      );
+      buffer.forEach(msg => attachmentStore.resolveMessageAssets(msg));
     } catch (e) {
       console.error("[ChatHistoryStore] Failed to stream history:", e);
     } finally {
@@ -196,6 +231,14 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       }
       loading.value = false;
       isLoadingHistory.value = false;
+
+      // 🆕 串行化安全保障：首次加载历史记录成功后，安全且串行地触发活跃流的检查与接续，杜绝对齐竞态
+      if (offset === 0 && !signal.aborted && sessionStore.currentTopicId === topicId) {
+        const streamStore = useChatStreamStore();
+        streamStore.checkAndRecoverInterruptedStreams().catch((err) => {
+          console.error("[ChatHistoryStore] Failed to trigger stream recovery after loading history:", err);
+        });
+      }
     }
   };
 
@@ -230,7 +273,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
 
     const agentId = sessionStore.currentSelectedItem.id;
     const topicId = sessionStore.currentTopicId;
-    acquireScreenKeep();
+
 
     try {
       const compiledBlocks = await invoke<ContentBlock[]>("append_single_message", {
@@ -302,6 +345,10 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
    */
   const sendMessage = async (content: string) => {
     if (!sessionStore.currentSelectedItem || !sessionStore.currentTopicId || (!content.trim() && attachmentStore.stagedAttachments.length === 0)) return;
+
+    if (typeof navigator !== "undefined" && navigator.vibrate) {
+      navigator.vibrate(25);
+    }
 
     if (editingOriginalMessageId.value) {
       const originalId = editingOriginalMessageId.value;
@@ -385,6 +432,24 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     }
   };
 
+  const deleteAttachment = async (topicId: string, messageId: string, hash: string) => {
+    // 1. 调用后端逻辑删除命令
+    await invoke("delete_message_attachment", {
+      topicId,
+      messageId,
+      hash,
+    });
+
+    // 2. 更新本地状态，以便在界面上实时隐藏该附件
+    const targetIndex = currentChatHistory.value.findIndex(m => m.id === messageId);
+    if (targetIndex !== -1) {
+      const msg = currentChatHistory.value[targetIndex];
+      if (msg.attachments) {
+        msg.attachments = msg.attachments.filter(att => att.hash !== hash);
+      }
+    }
+  };
+
   const updateMessageContent = async (messageId: string, newContent: string) => {
     clearMessageCache(messageId);
     const targetIndex = currentChatHistory.value.findIndex(m => m.id === messageId);
@@ -408,6 +473,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
             blocks: undefined,
           },
         });
+        clearMessageCache(messageId);
         currentChatHistory.value[targetIndex] = {
           ...currentChatHistory.value[targetIndex],
           blocks: compiledBlocks as any,
@@ -450,7 +516,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     currentChatHistory.value = currentChatHistory.value.slice(0, lastUserMsgIndex + 1);
     topicStore.decrementTopicMsgCount(topicId, countToDelete);
 
-    acquireScreenKeep();
+
 
     // 3. 调用后端重构后的重生接口
     try {
@@ -521,6 +587,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         messageId,
         topicId,
       });
+      clearMessageCache(messageId);
       currentChatHistory.value[targetIndex] = {
         ...currentChatHistory.value[targetIndex],
         blocks: compiledBlocks,
@@ -539,11 +606,14 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     isLoadingHistory,
     editMessageContent,
     editingOriginalMessageId,
+    preloadedHistory,
+    preloadHistory,
     loadHistory,
     loadHistoryPaginated,
     loadMoreHistory,
     sendMessage,
     deleteMessage,
+    deleteAttachment,
     triggerGeneration,
     summarizeTopic,
     updateMessageContent,

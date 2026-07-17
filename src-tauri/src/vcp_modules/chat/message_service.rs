@@ -1,8 +1,8 @@
 use crate::vcp_modules::chat_manager::{Attachment, ChatMessage};
 use crate::vcp_modules::content_parser::ContentBlock;
 use crate::vcp_modules::file_manager::get_attachments_root_dir;
+use crate::vcp_modules::message_repository::MessageRenderCompiler;
 use crate::vcp_modules::message_repository::MessageRepository;
-use crate::vcp_modules::message_repository::{ContentCompressor, MessageRenderCompiler};
 use crate::vcp_modules::settings_manager;
 use sqlx::Row;
 use std::path::Path;
@@ -60,8 +60,7 @@ pub async fn load_multi_topic_messages(
         let render_content: Option<Vec<u8>> = row.get("render_content");
         let blocks = parse_render_bytes(render_content);
 
-        let content_bytes: Vec<u8> = row.get("content");
-        let content = ContentCompressor::decompress(&content_bytes).unwrap_or_default();
+        let content: String = row.get("content");
         let content_hash_raw: String = row.get("content_hash");
         let content_hash = if content_hash_raw.is_empty() {
             None
@@ -106,7 +105,7 @@ pub async fn load_multi_topic_messages(
                     ma.topic_id, ma.msg_id, ma.display_name, ma.src, ma.status
              FROM message_attachments ma
              JOIN attachments a ON ma.hash = a.hash
-             WHERE (ma.topic_id, ma.msg_id) IN ({})
+             WHERE (ma.topic_id, ma.msg_id) IN ({}) AND ma.deleted_at IS NULL
              ORDER BY ma.topic_id, ma.msg_id, ma.attachment_order ASC",
             att_placeholders.join(",")
         );
@@ -174,16 +173,18 @@ pub async fn load_chat_history_internal(
     let offset = offset.unwrap_or(0);
 
     let query_str = if limit.is_some() {
-        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, m.content_hash 
+        "SELECT m.msg_id, m.role, COALESCE(m.name, a.name) as name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, m.content_hash 
          FROM messages m
          LEFT JOIN render_cache r ON m.topic_id = r.topic_id AND m.msg_id = r.msg_id
+         LEFT JOIN agents a ON m.agent_id = a.agent_id
          WHERE m.topic_id = ? AND m.deleted_at IS NULL 
          ORDER BY m.timestamp DESC, m.rowid DESC 
          LIMIT ? OFFSET ?"
     } else {
-        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, m.content_hash 
+        "SELECT m.msg_id, m.role, COALESCE(m.name, a.name) as name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, m.content_hash 
          FROM messages m
          LEFT JOIN render_cache r ON m.topic_id = r.topic_id AND m.msg_id = r.msg_id
+         LEFT JOIN agents a ON m.agent_id = a.agent_id
          WHERE m.topic_id = ? AND m.deleted_at IS NULL 
          ORDER BY m.timestamp DESC, m.rowid DESC"
     };
@@ -218,7 +219,7 @@ pub async fn load_chat_history_internal(
                     ma.msg_id, ma.display_name, ma.src, ma.status
              FROM message_attachments ma
              JOIN attachments a ON ma.hash = a.hash
-             WHERE ma.topic_id = ? AND ma.msg_id IN ({}) 
+             WHERE ma.topic_id = ? AND ma.msg_id IN ({}) AND ma.deleted_at IS NULL
              ORDER BY ma.msg_id, ma.attachment_order ASC",
             extracted_text_column, placeholders
         );
@@ -325,21 +326,21 @@ pub async fn load_chat_history_internal(
         let role: String = row.get("role");
         let name: Option<String> = row.get("name");
 
-        let content_bytes: Vec<u8> = row.get("content");
+        let content: String = row.get("content");
         let render_content: Option<Vec<u8>> = row.get("render_content");
 
         // 懒渲染策略：render_cache 命中则直接用，未命中则实时编译
         let (blocks, content) = if let Some(ref rb) = render_content {
             let blocks = parse_render_bytes(Some(rb.clone()));
             let content = if include_content {
-                ContentCompressor::decompress(&content_bytes).unwrap_or_default()
+                content
             } else {
                 String::new()
             };
             (blocks, content)
         } else {
-            // 未命中：解压 content → 编译 blocks → 异步回写 cache
-            let decompressed = ContentCompressor::decompress(&content_bytes).unwrap_or_default();
+            // 未命中：直接用明文 content → 编译 blocks → 异步回写 cache
+            let decompressed = content.clone();
             if decompressed.is_empty() {
                 (None, String::new())
             } else {
@@ -437,14 +438,16 @@ pub async fn load_chat_text_history_for_context(
 
     // 彻底剥离了对 render_cache 联表查询，仅拉取核心文本和配置字段
     let query_str = if limit.is_some() {
-        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash 
+        "SELECT m.msg_id, m.role, COALESCE(m.name, a.name) as name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash 
          FROM messages m
+         LEFT JOIN agents a ON m.agent_id = a.agent_id
          WHERE m.topic_id = ? AND m.deleted_at IS NULL 
          ORDER BY m.timestamp DESC, m.rowid DESC 
          LIMIT ? OFFSET ?"
     } else {
-        "SELECT m.msg_id, m.role, m.name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash 
+        "SELECT m.msg_id, m.role, COALESCE(m.name, a.name) as name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, m.content_hash 
          FROM messages m
+         LEFT JOIN agents a ON m.agent_id = a.agent_id
          WHERE m.topic_id = ? AND m.deleted_at IS NULL 
          ORDER BY m.timestamp DESC, m.rowid DESC"
     };
@@ -477,7 +480,7 @@ pub async fn load_chat_text_history_for_context(
                     ma.msg_id, ma.display_name, ma.src, ma.status
              FROM message_attachments ma
              JOIN attachments a ON ma.hash = a.hash
-             WHERE ma.topic_id = ? AND ma.msg_id IN ({}) 
+             WHERE ma.topic_id = ? AND ma.msg_id IN ({}) AND ma.deleted_at IS NULL
              ORDER BY ma.msg_id, ma.attachment_order ASC",
             extracted_text_column, placeholders
         );
@@ -531,8 +534,7 @@ pub async fn load_chat_text_history_for_context(
         let role: String = row.get("role");
         let name: Option<String> = row.get("name");
 
-        let content_bytes: Vec<u8> = row.get("content");
-        let content = ContentCompressor::decompress(&content_bytes).unwrap_or_default();
+        let content: String = row.get("content");
 
         let content_hash_raw: String = row.get("content_hash");
         let content_hash = if content_hash_raw.is_empty() {
@@ -646,8 +648,8 @@ async fn ensure_attachments_locally<R: tauri::Runtime>(
 pub async fn append_single_message<R: tauri::Runtime>(
     app_handle: AppHandle<R>,
     db_pool: &sqlx::Pool<sqlx::Sqlite>,
-    _owner_id: &str,
-    _owner_type: &str,
+    owner_id: &str,
+    owner_type: &str,
     topic_id: String,
     mut message: ChatMessage,
 ) -> Result<Vec<ContentBlock>, String> {
@@ -662,6 +664,22 @@ pub async fn append_single_message<R: tauri::Runtime>(
 
     let mut tx = db_pool.begin().await.map_err(|e| e.to_string())?;
     MessageRepository::upsert_message(&mut tx, &message, &topic_id, &render_bytes, false).await?;
+
+    // 如果是助手消息，且为流式生成初始状态（finish_reason 为空），注册到活跃生成表中
+    if message.role == "assistant" && message.finish_reason.is_none() {
+        sqlx::query(
+            "INSERT OR REPLACE INTO active_generations (msg_id, topic_id, owner_id, owner_type, created_at) \
+             VALUES (?, ?, ?, ?, ?)"
+        )
+        .bind(&message.id)
+        .bind(&topic_id)
+        .bind(owner_id)
+        .bind(owner_type)
+        .bind(message.timestamp as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
 
     let msg_count: i32 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM messages WHERE topic_id = ? AND deleted_at IS NULL",
@@ -682,13 +700,14 @@ pub async fn append_single_message<R: tauri::Runtime>(
 
     tx.commit().await.map_err(|e| e.to_string())?;
 
-    notify_topic_sync(
-        &app_handle,
-        db_pool,
-        &topic_id,
-        message.timestamp as i64,
-    )
-    .await?;
+    if message.role == "user" || !message.content.trim().is_empty() {
+        notify_topic_sync(&app_handle, db_pool, &topic_id, message.timestamp as i64).await?;
+    } else {
+        log::debug!(
+            "[MessageService] Deferring sync for empty assistant placeholder: message_id={}",
+            message.id
+        );
+    }
 
     Ok(blocks)
 }
@@ -709,13 +728,7 @@ pub async fn fetch_raw_message_content(
 
     match row {
         Some(r) => {
-            let bytes: Vec<u8> = r.get(0);
-            let content = ContentCompressor::decompress(&bytes).map_err(|e| {
-                format!(
-                    "Failed to decompress content for message {}: {}",
-                    message_id, e
-                )
-            })?;
+            let content: String = r.get(0);
             Ok(content)
         }
         None => Err(format!("Message {} not found", message_id)),
@@ -740,13 +753,7 @@ pub async fn re_render_message(
 
     match row {
         Some(r) => {
-            let bytes: Vec<u8> = r.get("content");
-            let decompressed = ContentCompressor::decompress(&bytes).map_err(|e| {
-                format!(
-                    "Failed to decompress content for message {} in topic {}: {}",
-                    message_id, topic_id, e
-                )
-            })?;
+            let decompressed: String = r.get("content");
 
             let compiled = MessageRenderCompiler::compile(&decompressed);
             let serialized = MessageRenderCompiler::serialize(&compiled)?;
@@ -818,8 +825,7 @@ async fn notify_topic_sync<R: tauri::Runtime>(
     topic_id: &str,
     timestamp: i64,
 ) -> Result<(), String> {
-    if let Some(sync_state) =
-        app_handle.try_state::<crate::vcp_modules::sync_service::SyncState>()
+    if let Some(sync_state) = app_handle.try_state::<crate::vcp_modules::sync_service::SyncState>()
     {
         let topic_hash: String =
             sqlx::query_scalar("SELECT config_hash FROM topics WHERE topic_id = ?")
@@ -884,6 +890,31 @@ pub async fn delete_messages(
         .await
         .map_err(|e| e.to_string())?;
 
+    // 级联清除活跃生成注册表，杜绝已删除消息复活
+    let delete_active_gen_query = format!(
+        "DELETE FROM active_generations WHERE topic_id = ? AND msg_id IN ({})",
+        msg_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
+    );
+    let mut q_active = sqlx::query(&delete_active_gen_query).bind(topic_id);
+    for id in &msg_ids {
+        q_active = q_active.bind(id);
+    }
+    q_active
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 同步清理 FTS5 全文检索索引，防止已删除消息残留在搜索结果中
+    let delete_fts_query = format!(
+        "DELETE FROM messages_fts WHERE topic_id = ? AND msg_id IN ({})",
+        msg_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
+    );
+    let mut q_fts = sqlx::query(&delete_fts_query).bind(topic_id);
+    for id in &msg_ids {
+        q_fts = q_fts.bind(id);
+    }
+    q_fts.execute(&mut *tx).await.map_err(|e| e.to_string())?;
+
     let msg_count: i32 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM messages WHERE topic_id = ? AND deleted_at IS NULL",
     )
@@ -920,6 +951,11 @@ pub async fn truncate_history_after_timestamp(
 
     sqlx::query("DELETE FROM message_attachments WHERE topic_id = ? AND msg_id IN (SELECT msg_id FROM messages WHERE topic_id = ? AND timestamp > ?)")
         .bind(topic_id).bind(topic_id).bind(timestamp).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+
+    // 同步清理 FTS5 全文检索索引，防止已删除消息残留在搜索结果中
+    sqlx::query("DELETE FROM messages_fts WHERE topic_id = ? AND msg_id IN (SELECT msg_id FROM messages WHERE topic_id = ? AND timestamp > ?)")
+        .bind(topic_id).bind(topic_id).bind(timestamp).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+
     let now = chrono::Utc::now().timestamp_millis();
     sqlx::query("UPDATE messages SET deleted_at = ? WHERE topic_id = ? AND timestamp > ?")
         .bind(now)
@@ -960,7 +996,6 @@ fn parse_render_bytes(render_content: Option<Vec<u8>>) -> Option<serde_json::Val
     })
 }
 
-/// 统一的流式落盘与终结编排器
 #[allow(clippy::too_many_arguments)]
 pub async fn finalize_stream_message<R: tauri::Runtime>(
     app_handle: AppHandle<R>,
@@ -973,6 +1008,7 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
     is_aborted: bool,
     finish_reason: Option<String>,
     stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
+    agent_id: Option<String>,
 ) -> Result<(), String> {
     let final_ts = crate::vcp_modules::infra::utils::now_millis() as u64;
 
@@ -988,40 +1024,34 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
             "> VCP流式错误: 已收到回复结束信号，但没有解析到正文。请重试此消息。".to_string();
     }
 
-    // 1. 查询时间锚定机制 V2 的启用状态，仅在启用时才开启正则，避免不必要开销
-    let enable_time_anchoring = match sqlx::query_scalar::<_, i32>(
-        "SELECT is_enabled FROM tarven_rules WHERE id = 'time_anchoring_v2'",
-    )
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(Some(val)) => val != 0,
-        _ => false,
+    let is_group = owner_type == "group";
+
+    let final_agent_id = if is_group {
+        agent_id
+    } else {
+        Some(owner_id.to_string())
     };
 
-    if enable_time_anchoring {
-        lazy_static::lazy_static! {
-            static ref TIME_XML_TAG_REGEX: fancy_regex::Regex = fancy_regex::Regex::new(r#"(?is)<message_time\s*>.*?</\s*message_time\s*>"#).unwrap();
+    let mut agent_name = None;
+    if let Some(ref aid) = final_agent_id {
+        if let Ok(Some(row)) = sqlx::query("SELECT name FROM agents WHERE agent_id = ?")
+            .bind(aid)
+            .fetch_optional(pool)
+            .await
+        {
+            use sqlx::Row;
+            agent_name = Some(row.get::<String, _>("name"));
         }
-        final_content = TIME_XML_TAG_REGEX
-            .replace_all(&final_content, "")
-            .to_string();
-        final_content = final_content.trim_end().to_string();
     }
 
-    let is_group = owner_type == "group";
     let final_msg = ChatMessage {
         id: message_id.clone(),
         role: "assistant".to_string(),
-        name: None,
+        name: agent_name,
         content: final_content,
         timestamp: final_ts,
         is_thinking: Some(false),
-        agent_id: if is_group {
-            None
-        } else {
-            Some(owner_id.to_string())
-        },
+        agent_id: final_agent_id,
         group_id: if is_group {
             Some(owner_id.to_string())
         } else {
@@ -1075,6 +1105,14 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
         }
     };
 
+    // ⚡ 注销活跃生成注册表中的记录 (清除断点续传事务日志)
+    if !message_id.is_empty() {
+        let _ = sqlx::query("DELETE FROM active_generations WHERE msg_id = ?")
+            .bind(&message_id)
+            .execute(pool)
+            .await;
+    }
+
     if let Some(chan) = stream_channel {
         let context = if owner_id.is_empty() || topic_id.is_empty() {
             None
@@ -1100,5 +1138,36 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
         ));
     }
 
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_message_attachment(
+    app_handle: tauri::AppHandle,
+    topic_id: String,
+    message_id: String,
+    hash: String,
+) -> Result<(), String> {
+    use crate::vcp_modules::db_manager::DbState;
+    use tauri::Manager;
+    let db_state = app_handle.state::<DbState>();
+    let pool = &db_state.pool;
+    let now = crate::vcp_modules::infra::utils::now_millis();
+    sqlx::query(
+        "UPDATE message_attachments SET deleted_at = ? \
+         WHERE topic_id = ? AND msg_id = ? AND hash = ?",
+    )
+    .bind(now)
+    .bind(&topic_id)
+    .bind(&message_id)
+    .bind(&hash)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // ⚡ 冒泡更新主题内容哈希，使该删除动作能够在局域网同步端识别并广播
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    crate::vcp_modules::sync_hash::HashAggregator::bubble_from_topic(&mut tx, &topic_id).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
     Ok(())
 }

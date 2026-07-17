@@ -176,7 +176,7 @@ const loadPluginsMetadata = async () => {
         description: tool.description || "",
         type: tool.category || "oneshot",
         placeholder: tool.placeholder || undefined,
-        icon: tool.icon || "i-lucide-toy-brick",
+        icon: tool.icon || "i-ph:cube-bold",
         communication: tool.communication,
         enabled: tool.enabled !== undefined ? tool.enabled : true,
         requiresRoot: !!tool.requiresRoot
@@ -504,7 +504,7 @@ watch(
       </div>
 
       <!-- Tab Content Area -->
-      <div class="flex-1 overflow-y-auto no-rubber-band relative">
+      <div class="flex-1 overflow-y-auto no-rubber-band relative pb-[calc(var(--vcp-safe-bottom,48px))]">
         <!-- 1. Connection view -->
         <div v-if="activeTab === 'connection'" class="px-4 py-6 space-y-6">
           <!-- Connection Status Card -->

@@ -202,10 +202,7 @@ onUnmounted(() => {
         <!-- 头像展示 -->
         <VcpAvatar 
           v-if="sessionStore.currentSelectedItem"
-          :owner-type="sessionStore.currentSelectedItem.type" 
-          :owner-id="sessionStore.currentSelectedItem.id" 
-          :fallback-name="sessionStore.currentSelectedItem.name"
-          :dominant-color="sessionStore.currentSelectedItem.avatarCalculatedColor"
+          :target="sessionStore.currentSelectedItem"
           size="w-10 h-10"
           rounded="rounded-full"
           class="shrink-0"
@@ -216,7 +213,7 @@ onUnmounted(() => {
             class="font-bold text-sm truncate transition-colors duration-500"
             :style="{ color: sessionStore.currentSelectedItem?.avatarCalculatedColor || 'var(--primary-text)' }"
           >
-            {{ sessionStore.currentSelectedItem?.name || "VCP Mobile" }}
+            {{ sessionStore.headerTitle }}
           </span>
   <div class="flex items-center gap-1" :title="lifecycleStore.errorMsg || undefined">
     <CoreStatusIndicator />
@@ -306,7 +303,7 @@ onUnmounted(() => {
     <Transition name="fade-slide-up">
       <button v-if="showScrollToBottom" @click="scrollToBottom(true)"
         class="absolute right-4 w-10 h-10 bg-white/80 dark:bg-gray-800/80 rounded-full shadow-lg border border-black/10 dark:border-white/10 flex items-center justify-center text-primary-text z-local active:scale-90 transition-[bottom,transform,opacity] duration-300 ease-[cubic-bezier(0.34,1.56,0.64,1)]"
-        :style="{ bottom: `calc(6rem + ${isMenuExpanded ? 112 : 0}px + var(--keyboard-offset, 0px))` }"
+        :style="{ bottom: `calc(var(--vcp-safe-bottom, 48px) + 6rem + ${isMenuExpanded ? 112 : 0}px + var(--keyboard-offset, 0px))` }"
       >
         <ArrowDown :size="20" />
       </button>
@@ -320,7 +317,7 @@ onUnmounted(() => {
         @toggle-menu="handleMenuToggle" 
         @focus-input="scrollToBottom(true)"
       />
-      <div class="h-[calc(var(--vcp-safe-bottom,20px)+var(--keyboard-offset,0px))] no-swipe pointer-events-none"></div>
+      <div class="h-[calc(var(--vcp-safe-bottom,48px)+var(--keyboard-offset,0px))] no-swipe pointer-events-none"></div>
     </footer>
 
     <!-- VCPChatTarven 规则快捷选择器 -->
@@ -333,11 +330,13 @@ onUnmounted(() => {
   /* 强制适配刘海屏，增加保底 padding */
   padding-top: calc(var(--vcp-safe-top, 24px));
   padding-bottom: 12px;
+  background-color: var(--secondary-bg);
   background-color: color-mix(in srgb, var(--secondary-bg) 97%, transparent);
   border-bottom: 1px solid transparent;
 }
 
 .vcp-input-footer {
+  background-color: var(--secondary-bg);
   background-color: color-mix(in srgb, var(--secondary-bg) 90%, transparent);
 }
 

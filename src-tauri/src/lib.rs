@@ -2,6 +2,7 @@ mod distributed;
 mod vcp_modules;
 
 use tauri::{Listener, Manager};
+use tauri_plugin_log::{Target, TargetKind};
 use vcp_modules::agent_chat_application_service::{
     handle_agent_chat_message, handle_assistant_chat_stream,
 };
@@ -9,7 +10,9 @@ use vcp_modules::agent_service::{
     create_agent, delete_agent, get_agents, get_assistants_snapshot, read_agent_config,
     save_agent_config, update_agent_config,
 };
-use vcp_modules::avatar_service::{get_avatar, save_avatar_data, store_dominant_color};
+use vcp_modules::avatar_service::{
+    batch_get_avatars, get_avatar, save_avatar_data, store_dominant_color,
+};
 use vcp_modules::chat_manager::{
     append_single_message, delete_messages, load_chat_history, load_chat_history_streamed,
     patch_single_message, truncate_history_after_timestamp,
@@ -19,14 +22,12 @@ use vcp_modules::context_injection::{
     save_tarven_rule, toggle_rule_enabled,
 };
 use vcp_modules::context_sanitizer::ContextSanitizer;
-use vcp_modules::settings_manager::{read_settings, set_theme, update_settings, write_settings};
-// use vcp_modules::db_manager::DbState;
-use tauri_plugin_log::{Target, TargetKind};
+use vcp_modules::db_manager::search_messages_fts;
 use vcp_modules::emoticon_manager::{
     fix_emoticon_url, get_emoticon_library, regenerate_emoticon_library,
 };
 use vcp_modules::file_manager::{
-    get_attachment_real_path, open_file, register_local_file, store_file,
+    check_attachment_support, get_attachment_real_path, open_file, register_local_file, store_file,
 };
 use vcp_modules::frontend_update_manager::{
     apply_frontend_update, check_for_frontend_update, clear_frontend_updates,
@@ -40,18 +41,21 @@ use vcp_modules::group_service::{
 use vcp_modules::high_speed_channel::prepare_vcp_upload;
 use vcp_modules::lifecycle_manager::{
     bootstrap, get_core_status, get_last_error, get_system_snapshot,
-    reconcile_distributed_node_cmd, reconcile_local_server_cmd, LifecycleState,
+    reconcile_distributed_node_cmd, reconcile_local_server_cmd, restart_or_exit_app,
+    set_app_foreground_state, LifecycleState,
 };
 use vcp_modules::maintenance_manager::{
     cleanup_orphaned_attachments, cleanup_single_orphaned_attachment, clear_webview_cache,
     init_automatic_maintenance, reconstruct_system_cache,
 };
 use vcp_modules::message_repository::{process_message_content, rebuild_all_pre_renders};
+use vcp_modules::message_service::delete_message_attachment;
 use vcp_modules::message_service::{fetch_raw_message_content, re_render_message};
 use vcp_modules::model_manager::{
     get_cached_models, get_favorite_models, get_hot_models, record_model_usage, refresh_models,
-    toggle_favorite_model,
+    start_batch_model_test, stop_all_model_tests, test_model_connectivity, toggle_favorite_model,
 };
+use vcp_modules::settings_manager::{read_settings, set_theme, update_settings, write_settings};
 
 use vcp_modules::sync_service::{
     clear_old_sync_logs, get_sync_session_log_path, get_sync_status, list_sync_log_files,
@@ -64,8 +68,8 @@ use vcp_modules::topic_service::{
 };
 use vcp_modules::update_manager::{check_for_update, download_update, install_update};
 use vcp_modules::vcp_client::{
-    interruptGroupTurn, interruptRequest, sendToVCP, test_vcp_connection, ActiveRequests,
-    CancelledGroupTurns,
+    get_active_generations, interruptGroupTurn, interruptRequest, recover_active_generation,
+    resume_stream, sendToVCP, test_vcp_connection, ActiveRequests, CancelledGroupTurns,
 };
 use vcp_modules::vcp_info_service::{
     clear_vcp_info, get_vcp_info_connection_status, get_vcp_info_metadata_list,
@@ -113,9 +117,7 @@ pub fn run() {
         context.set_assets(Box::new(ota_assets));
     }
 
-    let builder = tauri::Builder::default();
-
-    builder
+    let app = tauri::Builder::default()
         .setup(|app| {
             // 2. 初始化核心状态
             app.manage(app.handle().clone());
@@ -174,20 +176,50 @@ pub fn run() {
                 }
             });
 
+
+
+            // 5. 监听由 Kotlin LifecycleBridge 发回的原生进程级生命周期事件
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                let handle_lifecycle = app.handle().clone();
+                app.listen_any("vcp-mobile://lifecycle", move |event| {
+                    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(event.payload()) {
+                        if let Some(state) = payload.get("state").and_then(|v| v.as_str()) {
+                            let handle = handle_lifecycle.clone();
+                            if state == "pause" || state == "stop" {
+                                log::info!("[Lifecycle] App entered background (state={})", state);
+                                tauri::async_runtime::spawn(async move {
+                                    vcp_modules::lifecycle_manager::set_app_foreground_state_internal(handle, false).await;
+                                });
+                            } else if state == "resume" {
+                                log::info!("[Lifecycle] App entered foreground (state={})", state);
+                                tauri::async_runtime::spawn(async move {
+                                    vcp_modules::lifecycle_manager::set_app_foreground_state_internal(handle, true).await;
+                                });
+                            }
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .plugin(
             tauri_plugin_log::Builder::new()
                 .targets({
-                    let mut targets = vec![
+                    let targets = vec![
                         Target::new(TargetKind::Stdout),
                         Target::new(TargetKind::LogDir { file_name: None }),
+                        #[cfg(any(debug_assertions, not(mobile)))]
+                        Target::new(TargetKind::Webview),
                     ];
-                    #[cfg(any(debug_assertions, not(mobile)))]
-                    targets.push(Target::new(TargetKind::Webview));
                     targets
                 })
-                .level(log::LevelFilter::Info)
+                .level(if cfg!(debug_assertions) {
+                    log::LevelFilter::Debug
+                } else {
+                    log::LevelFilter::Warn
+                })
                 .filter(|metadata| {
                     let target = metadata.target();
                     // 屏蔽高频 UI 交互、系统窗口以及 Android 系统底层冗余日志
@@ -208,6 +240,9 @@ pub fn run() {
         .plugin(tauri_plugin_vcp_mobile::init())
         .invoke_handler(tauri::generate_handler![
             sendToVCP,
+            get_active_generations,
+            recover_active_generation,
+            resume_stream,
             get_tarven_rules,
             save_tarven_rule,
             delete_tarven_rule,
@@ -224,6 +259,8 @@ pub fn run() {
             append_single_message,
             patch_single_message,
             delete_messages,
+            delete_message_attachment,
+            search_messages_fts,
             truncate_history_after_timestamp,
             process_message_content,
             rebuild_all_pre_renders,
@@ -245,6 +282,7 @@ pub fn run() {
             update_agent_config,
             save_avatar_data,
             get_avatar,
+            batch_get_avatars,
             store_dominant_color,
             read_settings,
             write_settings,
@@ -258,6 +296,7 @@ pub fn run() {
             delete_agent,
             set_theme,
             store_file,
+            check_attachment_support,
             register_local_file,
             prepare_vcp_upload,
             fetch_raw_message_content,
@@ -274,10 +313,14 @@ pub fn run() {
             get_favorite_models,
             toggle_favorite_model,
             record_model_usage,
+            test_model_connectivity,
+            start_batch_model_test,
+            stop_all_model_tests,
             summarize_topic,
             init_vcp_log_connection,
             send_vcp_log_message,
             set_vcp_log_heartbeat,
+            set_app_foreground_state,
             init_vcp_info_connection,
             get_vcp_info_connection_status,
             get_vcp_info_metadata_list,
@@ -313,7 +356,28 @@ pub fn run() {
             get_active_frontend_version,
             clear_frontend_updates,
             confirm_frontend_boot,
+            tauri_plugin_vcp_mobile::stream::set_keepalive_mode,
+            restart_or_exit_app,
         ])
-        .run(context)
-        .expect("error while running tauri application");
+        .build(context)
+        .expect("error while building tauri application");
+
+    app.run(|_app_handle, event| match event {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        tauri::RunEvent::WindowEvent {
+            event: tauri::WindowEvent::Focused(focused),
+            ..
+        } => {
+            log::info!(
+                "[Lifecycle] Native WindowEvent::Focused: focused={}",
+                focused
+            );
+            let handle = _app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                vcp_modules::lifecycle_manager::set_app_foreground_state_internal(handle, focused)
+                    .await;
+            });
+        }
+        _ => {}
+    });
 }

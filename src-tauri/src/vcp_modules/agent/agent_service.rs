@@ -60,6 +60,11 @@ pub fn create_default_config(agent_id: &str) -> AgentConfig {
     }
 }
 
+/// 🛡️ 前端专属数据加载指令 (仅供 Vue 前端跨进程 IPC 调用)
+///
+/// ⚠️ 警告：出于数据防泄密及减轻跨端传输 IPC 序列化性能开销的考量，此接口在返回前会【强行清空】`system_prompt`。
+/// ❌ 绝对禁止在 Rust 后端业务逻辑、群聊组装或同步推送代码中调用此函数！
+/// ➡️ 后端读取完整智能体配置请使用 `read_agent_config_internal`！
 #[tauri::command]
 pub async fn read_agent_config<R: Runtime>(
     app_handle: AppHandle<R>,
@@ -356,6 +361,7 @@ async fn internal_write_agent_config<R: Runtime>(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(agent_id) DO UPDATE SET
             name = excluded.name, 
+            system_prompt = excluded.system_prompt,
             mobile_system_prompt = excluded.mobile_system_prompt,
             model = excluded.model, 
             temperature = excluded.temperature, 
@@ -442,6 +448,29 @@ pub async fn delete_agent(
 
     sqlx::query("UPDATE agents SET deleted_at = ? WHERE agent_id = ?")
         .bind(now)
+        .bind(&agent_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 级联将该 Agent 下的所有话题标记为逻辑删除
+    sqlx::query("UPDATE topics SET deleted_at = ? WHERE owner_id = ? AND owner_type = 'agent' AND deleted_at IS NULL")
+        .bind(now)
+        .bind(&agent_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 级联将该 Agent 下所有话题的所有消息标记为逻辑删除
+    sqlx::query("UPDATE messages SET deleted_at = ? WHERE topic_id IN (SELECT topic_id FROM topics WHERE owner_id = ? AND owner_type = 'agent') AND deleted_at IS NULL")
+        .bind(now)
+        .bind(&agent_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 级联清除该 Agent 下的所有活跃生成，杜绝已删除消息复活
+    sqlx::query("DELETE FROM active_generations WHERE owner_id = ? AND owner_type = 'agent'")
         .bind(&agent_id)
         .execute(pool)
         .await

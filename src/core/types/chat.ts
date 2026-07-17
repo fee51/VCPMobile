@@ -7,7 +7,7 @@ export interface MessageShell {
 }
 
 export type MarkdownNode = {
-  type: "paragraph" | "heading" | "code_block" | "blockquote" | "list" | "table" | "thematic_break" | "raw_html" | "mermaid";
+  type: "paragraph" | "heading" | "code_block" | "blockquote" | "list" | "table" | "thematic_break" | "raw_html";
   children?: InlineNode[];
   level?: number;
   lang?: string;
@@ -25,7 +25,8 @@ export type MarkdownNode = {
 };
 
 export type InlineNode = {
-  type: "text" | "strong" | "emphasis" | "strikethrough" | "code" | "link" | "image" | "line_break" | "soft_break" | "inline_math" | "quoted_text" | "highlight_tag" | "alert_tag" | "raw_html_inline";
+  type: "text" | "strong" | "emphasis" | "strikethrough" | "code" | "link" | "image" | "break" | "inline_math" | "vcp_custom" | "raw_html_inline";
+  kind?: string;
   value?: string;
   children?: InlineNode[];
   href?: string;
@@ -38,6 +39,11 @@ export type InlineNode = {
   hash?: string | number;
 };
 
+export interface ToolCallSummaryItem {
+  tool_name: string;
+  status: string;
+}
+
 export interface ContentBlock {
   type:
   | "markdown"
@@ -49,7 +55,8 @@ export interface ContentBlock {
   | "html-preview"
   | "role-divider"
   | "style"
-  | "math";
+  | "math"
+  | "tool-call-summary";
   content?: string;
   nodes?: MarkdownNode[]; // For type: "markdown", "diary", "thought"
   tool_name?: string;
@@ -64,6 +71,8 @@ export interface ContentBlock {
   is_end?: boolean;
   display_mode?: boolean;
   highlighted_content?: string;
+  items?: ToolCallSummaryItem[]; // For type: "tool-call-summary"
+  raw_content?: string;          // For type: "tool-call-summary"
   hash?: string | number;
 }
 
@@ -111,6 +120,29 @@ export interface ChatMessage {
   // 以下为纯前端运行时 UI 状态 (Ephemeral)，绝不进行持久化
   tailContent?: string;      // Aurora: 尾随区 Markdown (高频变动)
   tailBlock?: ContentBlock;
+  tailFrame?: TailFrame;
+  tailSnapshot?: MarkdownNode[];
+  isReconnecting?: boolean;  // 🆕 流接续重连中状态
+}
+
+export type AstMutation =
+  | { op: "add"; id: string; parent: string; node: MarkdownNode }
+  | { op: "add_inline"; id: string; parent: string; node: InlineNode }
+  | { op: "add_list_item"; id: string; parent: string; children: MarkdownNode[] }
+  | { op: "text"; id: string; value: string }
+  | { op: "append"; id: string; chunk: string }
+  | { op: "prop"; id: string; key: string; value: string }
+  | { op: "replace"; id: string; node: MarkdownNode }
+  | { op: "replace_inline"; id: string; node: InlineNode }
+  | { op: "remove"; id: string };
+
+export interface TailFrame {
+  epoch: number;
+  revision: number;
+  frameSeq: number;
+  reset?: boolean;
+  snapshot?: MarkdownNode[];
+  mutations: AstMutation[];
 }
 
 /**
@@ -173,7 +205,10 @@ export interface AuroraUpdate {
   tailBlock?: StreamBlock;
   tail?: string;
   tailChanged?: boolean;
+  tailFrame?: TailFrame;
+  tailSnapshot?: MarkdownNode[];
   content?: string;
+  chunk?: string;
 }
 
 /**

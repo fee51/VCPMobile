@@ -1,12 +1,13 @@
 import { defineStore } from "pinia";
 import { ref, computed, reactive, onScopeDispose } from "vue";
-import { invoke } from "@tauri-apps/api/core";
-import { releaseScreenKeep } from "../composables/useScreenKeeper";
+import { invoke, Channel } from "@tauri-apps/api/core";
+
 import { useChatSessionStore } from "./chatSessionStore";
 import { useAssistantStore } from "./assistant";
 import { useAvatarStore } from "./avatar";
 import { useTopicStore } from "./topicListManager";
-import type { ChatMessage, MessageShell } from "../types/chat";
+import { useChatHistoryStore } from "./chatHistoryStore";
+import type { ChatMessage, MessageShell, TailFrame } from "../types/chat";
 
 export const useChatStreamStore = defineStore("chatStream", () => {
   const streamingMessageId = ref<string | null>(null);
@@ -19,6 +20,48 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   // 无论是在前台还是后台，流式消息都从此池中获取，保证响应式链路不断裂
   const activeStreamMessages = reactive<Map<string, ChatMessage>>(new Map());
 
+  function isStreamDebugEnabled(): boolean {
+    return Boolean(import.meta.env.DEV && (window as any).__VCP_STREAM_DEBUG__);
+  }
+
+  function recordStreamTrace(data: any): void {
+    if (!isStreamDebugEnabled()) return;
+    if (!(window as any).__VCP_STREAM_TRACES__) {
+      (window as any).__VCP_STREAM_TRACES__ = [];
+    }
+    (window as any).__VCP_STREAM_TRACES__.push({
+      timestamp: performance.now(),
+      ...data,
+    });
+  }
+
+  function streamDebugLog(...args: unknown[]): void {
+    if (isStreamDebugEnabled()) {
+      console.warn(...args);
+    }
+  }
+
+  function mergeTailFrame(existing: TailFrame | null, incoming: TailFrame): TailFrame {
+    const incomingMutations = incoming.mutations || [];
+    if (!existing || incoming.reset || incoming.epoch !== existing.epoch) {
+      return {
+        ...incoming,
+        mutations: incoming.reset ? [] : [...incomingMutations],
+        snapshot: incoming.snapshot ? [...incoming.snapshot] : undefined,
+      };
+    }
+
+    return {
+      ...incoming,
+      reset: existing.reset || incoming.reset,
+      snapshot: incoming.snapshot || existing.snapshot,
+      mutations: [
+        ...(existing.reset ? [] : existing.mutations || []),
+        ...incomingMutations,
+      ],
+    };
+  }
+
   const cleanupTimers = new Set<ReturnType<typeof setTimeout>>();
 
   // ===== rAF 30Hz 帧合并直推暂存池 =====
@@ -28,6 +71,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     blocks: any[] | null;
     tailContent: string | null;
     tailBlock: any | null;
+    tailFrame: TailFrame | null;
+    tailSnapshot: any[] | null;
     animationFrameId: number | null;
     lastRenderTime: number;
   }>();
@@ -51,10 +96,55 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           // 漏洞 1 修复：同步强刷收尾时，必须将暂存池中的 tail 字段强刷，绝不允许丢字闪烁
           if (up.tailContent !== null) msg.tailContent = up.tailContent;
           if (up.tailBlock !== undefined) msg.tailBlock = up.tailBlock;
+          if (up.tailSnapshot !== null) msg.tailSnapshot = up.tailSnapshot as any;
+          if (up.tailFrame !== null) msg.tailFrame = up.tailFrame;
         }
       }
       rAFPendingUpdates.delete(messageId);
     }
+  };
+
+  /**
+   * 调度并申请 rAF 渲染，合并 data 和 aurora 的高频更新，在同一渲染帧内原子写入
+   */
+  const scheduleRAFUpdate = (messageId: string) => {
+    const update = rAFPendingUpdates.get(messageId);
+    if (!update || update.animationFrameId !== null) return;
+
+    const runRenderLoop = () => {
+      const up = rAFPendingUpdates.get(messageId);
+      if (!up) return;
+
+      const now = performance.now();
+      const elapsed = now - up.lastRenderTime;
+
+      if (elapsed >= MIN_RENDER_INTERVAL_MS) {
+        // 满足 30Hz 时间间隔，以原子事务方式刷入 Vue 响应式数据
+        const m = activeStreamMessages.get(messageId);
+        if (m) {
+          if (up.content !== null) m.content = up.content;
+          if (up.blocks !== null) m.blocks = up.blocks;
+          if (up.tailSnapshot !== null) m.tailSnapshot = up.tailSnapshot as any;
+          if (up.tailFrame !== null) m.tailFrame = up.tailFrame;
+          if (up.tailContent !== null) m.tailContent = up.tailContent;
+          if (up.tailBlock !== undefined) m.tailBlock = up.tailBlock;
+        }
+        up.lastRenderTime = now;
+        // 重置当前帧内的合并暂存状态
+        up.content = null;
+        up.blocks = null;
+        up.tailContent = null;
+        up.tailBlock = null;
+        up.tailFrame = null;
+        up.tailSnapshot = null;
+        up.animationFrameId = null;
+      } else {
+        // 未到时间阀值，在下一物理帧继续尝试
+        up.animationFrameId = requestAnimationFrame(runRenderLoop);
+      }
+    };
+    
+    update.animationFrameId = requestAnimationFrame(runRenderLoop);
   };
 
   const sessionStore = useChatSessionStore();
@@ -89,12 +179,36 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     };
   }
 
+  const activeStreamSets = computed(() => {
+    const sets: Record<string, Set<string>> = {};
+    for (const [key, streams] of Object.entries(sessionActiveStreams.value)) {
+      sets[key] = new Set(streams);
+    }
+    return sets;
+  });
+
+  const activeStreamIdSet = computed(() => {
+    const ids = new Set<string>();
+    for (const streams of Object.values(sessionActiveStreams.value)) {
+      for (const id of streams) ids.add(id);
+    }
+    return ids;
+  });
+
+  function isMessageActive(messageId: string): boolean {
+    return activeStreamIdSet.value.has(messageId);
+  }
+
+  function isMessageActiveInSession(ownerId: string, topicId: string, messageId: string): boolean {
+    return activeStreamSets.value[`${ownerId}:${topicId}`]?.has(messageId) ?? false;
+  }
+
   // 兼容旧逻辑的计算属性
   const activeStreamingIds = computed(() => {
     if (!sessionStore.currentSelectedItem?.id || !sessionStore.currentTopicId)
       return new Set<string>();
     const key = `${sessionStore.currentSelectedItem.id}:${sessionStore.currentTopicId}`;
-    return new Set(sessionActiveStreams.value[key] || []);
+    return activeStreamSets.value[key] || new Set<string>();
   });
 
   const isGroupGenerating = computed(() => {
@@ -114,13 +228,14 @@ export const useChatStreamStore = defineStore("chatStream", () => {
 
   const enforceStreamPoolLimit = () => {
     if (activeStreamMessages.size <= MAX_STREAM_MESSAGES) return;
-    const excess = activeStreamMessages.size - MAX_STREAM_MESSAGES;
+    let remaining = activeStreamMessages.size - MAX_STREAM_MESSAGES;
     // 按插入顺序（Map 保持插入顺序）清理最旧的非活跃消息
     for (const [id] of activeStreamMessages) {
-      if (excess <= 0) break;
+      if (remaining <= 0) break;
       // 只删除已完成的流（不在当前活跃会话中）
-      if (!activeStreamingIds.value.has(id)) {
+      if (!isMessageActive(id)) {
         activeStreamMessages.delete(id);
+        remaining -= 1;
       }
     }
   };
@@ -149,19 +264,14 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   ) => {
     const key = `${ownerId}:${topicId}`;
     const streams = sessionActiveStreams.value[key];
-    let didRemove = false;
     if (streams) {
       const index = streams.indexOf(messageId);
       if (index !== -1) {
         streams.splice(index, 1);
-        didRemove = true;
       }
       if (streams.length === 0) {
         delete sessionActiveStreams.value[key];
       }
-    }
-    if (didRemove && Object.keys(sessionActiveStreams.value).length === 0) {
-      releaseScreenKeep();
     }
     // 同时从全局池中移除 (延迟移除，确保 finalizeStream 能拿到对象)
     const cleanupTimer = setTimeout(() => {
@@ -181,7 +291,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     onStreamFinished?: (messageId: string, topicId: string) => void;
   }) => {
     const actualMessageId = event.messageId || event.message_id || "";
-    const { chunk, type, context } = event;
+    const { type, context } = event;
     const ctx = context || {};
     const topicId = ctx.topicId;
     const isGroup = !!ctx.isGroupMessage || !!ctx.groupId;
@@ -217,28 +327,30 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         callbacks.onMessageCreated(msg!, topicId);
       }
 
-      // [关键修复] 异步持久化骨架消息到 SQLite 数据库
+      // [关键修复] 异步持久化骨架消息到 SQLite 数据库（排除不需要持久化的浮动助手对话）
       // 使得用户即便中途切换会话，重新加载历史时也存在此消息占位，从而触发 Object Hydration 完美接续流式动画
-      invoke("append_single_message", {
-        ownerId: itemId,
-        ownerType: isGroup ? "group" : "agent",
-        topicId,
-        message: {
-          id: actualMessageId,
-          role: "assistant",
-          name: ctx.agentName || null,
-          content: "",
-          timestamp: msg!.timestamp,
-          isThinking: msg!.isThinking,
-          is_thinking: msg!.isThinking,
-          agentId: ctx.agentId || null,
-          groupId: ctx.groupId || null,
+      if (topicId !== "assistant_chat") {
+        invoke("append_single_message", {
+          ownerId: itemId,
+          ownerType: isGroup ? "group" : "agent",
           topicId,
-          isGroupMessage: isGroup,
-        }
-      }).catch(e => {
-        console.error("[ChatStreamStore] Failed to persist initial thinking skeleton:", e);
-      });
+          message: {
+            id: actualMessageId,
+            role: "assistant",
+            name: ctx.agentName || null,
+            content: "",
+            timestamp: msg!.timestamp,
+            isThinking: msg!.isThinking,
+            is_thinking: msg!.isThinking,
+            agentId: ctx.agentId || null,
+            groupId: ctx.groupId || null,
+            topicId,
+            isGroupMessage: isGroup,
+          }
+        }).catch(e => {
+          console.error("[ChatStreamStore] Failed to persist initial thinking skeleton:", e);
+        });
+      }
     }
 
     // 维护流状态
@@ -248,49 +360,36 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       if (!streamingMessageId.value) {
         streamingMessageId.value = actualMessageId;
       }
-    } else if (type === "data") {
+    } else if (type === "aurora") {
       msg!.isThinking = false;
       addSessionStream(itemId, topicId, actualMessageId);
 
-      let textChunk = "";
-      if (typeof chunk === "string") {
-        textChunk = chunk;
-      } else if (chunk && chunk.choices && chunk.choices.length > 0) {
-        const delta = chunk.choices[0].delta;
-        if (delta && delta.content) textChunk = delta.content;
-      }
-
-      if (textChunk) {
-        msg!.content = (msg!.content || "") + textChunk;
-        msg!.tailContent = msg!.content;
-      }
-    } else if (type === "aurora") {
       const aurora = event.aurora;
       if (aurora) {
-        // === 🚀 开启流式时空录制（开发模式生效，Release 构建时自动摇树切除） ===
-        if (import.meta.env.DEV) {
-          if (!(window as any).__VCP_STREAM_TRACES__) {
-            (window as any).__VCP_STREAM_TRACES__ = [];
-          }
-          (window as any).__VCP_STREAM_TRACES__.push({
-            timestamp: performance.now(),
-            messageId: actualMessageId,
-            auroraPayload: {
-              stableChanged: aurora.stableChanged,
-              stableBlocksCount: aurora.stableBlocks?.length || 0,
-              stableBlocksHashes: aurora.stableBlocks?.map((b: any) => b.hash) || [],
-              tailChanged: aurora.tailChanged,
-              tailContent: aurora.tail || "",
-              tailBlockType: aurora.tailBlock?.type || null
-            },
-            msgSnapshot: msg ? {
-              content: msg.content,
-              blocksCount: msg.blocks?.length || 0,
-              tailContent: msg.tailContent,
-            } : null
-          });
-        }
-        // ==========================
+        recordStreamTrace({
+          messageId: actualMessageId,
+          auroraPayload: {
+            stableChanged: aurora.stableChanged,
+            stableBlocksCount: aurora.stableBlocks?.length || 0,
+            stableBlocksHashes: aurora.stableBlocks?.map((b: any) => b.hash) || [],
+            tailChanged: aurora.tailChanged,
+            tailContent: aurora.tail || "",
+            tailBlockType: aurora.tailBlock?.type || null,
+            tailFrame: aurora.tailFrame ? {
+              epoch: aurora.tailFrame.epoch,
+              revision: aurora.tailFrame.revision,
+              frameSeq: aurora.tailFrame.frameSeq,
+              reset: aurora.tailFrame.reset,
+              mutationsCount: aurora.tailFrame.mutations?.length || 0,
+              hasSnapshot: !!aurora.tailFrame.snapshot,
+            } : null,
+          },
+          msgSnapshot: msg ? {
+            contentLength: msg.content?.length || 0,
+            blocksCount: msg.blocks?.length || 0,
+            tailContentLength: msg.tailContent?.length || 0,
+          } : null,
+        });
 
         // 1. 初始化或获取该 messageId 的帧合并状态
         let update = rAFPendingUpdates.get(actualMessageId);
@@ -300,6 +399,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
             blocks: null,
             tailContent: null,
             tailBlock: null,
+            tailFrame: null,
+            tailSnapshot: null,
             animationFrameId: null,
             lastRenderTime: 0,
           };
@@ -309,50 +410,31 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         // 2. 覆盖写入暂存数据（稀疏合并）
         if (typeof aurora.content === "string") {
           update.content = aurora.content;
+        } else if (aurora.chunk) {
+          const currentBase = update.content !== null ? update.content : (msg!.content || "");
+          update.content = currentBase + aurora.chunk;
         }
         if (aurora.stableChanged && aurora.stableBlocks) {
           update.blocks = aurora.stableBlocks;
+        }
+        if (aurora.tailFrame) {
+          streamDebugLog(`[chatStreamStore] Received tailFrame seq=${aurora.tailFrame.frameSeq} mutations=${aurora.tailFrame.mutations?.length || 0} for ${actualMessageId}`);
+          update.tailFrame = mergeTailFrame(update.tailFrame, aurora.tailFrame);
+          if (aurora.tailFrame.snapshot) {
+            update.tailSnapshot = aurora.tailFrame.snapshot as any[];
+          }
+        }
+        if (aurora.tailSnapshot) {
+          update.tailSnapshot = aurora.tailSnapshot as any[];
         }
         if (aurora.tailChanged) {
           update.tailContent = aurora.tail || "";
           update.tailBlock = (aurora.tailBlock as any) || null;
         }
 
-        // 3. 申请硬件级 rAF 自适应阻尼渲染（最大 30Hz）
-        if (update.animationFrameId === null) {
-          const runRenderLoop = () => {
-            const up = rAFPendingUpdates.get(actualMessageId);
-            if (!up) return;
-
-            const now = performance.now();
-            const elapsed = now - up.lastRenderTime;
-
-            if (elapsed >= MIN_RENDER_INTERVAL_MS) {
-              // 满足约 30Hz 间隔，触发 Vue 响应式写入进行重绘
-              const m = activeStreamMessages.get(actualMessageId);
-              if (m) {
-                if (up.content !== null) m.content = up.content;
-                if (up.blocks !== null) m.blocks = up.blocks;
-                if (up.tailContent !== null) m.tailContent = up.tailContent;
-                if (up.tailBlock !== undefined) m.tailBlock = up.tailBlock;
-              }
-              up.lastRenderTime = now;
-              // 重置当前帧内的合并暂存状态
-              up.content = null;
-              up.blocks = null;
-              up.tailContent = null;
-              up.tailBlock = null;
-              up.animationFrameId = null;
-            } else {
-              // 没到门槛，在下一屏幕物理刷新帧继续尝试
-              up.animationFrameId = requestAnimationFrame(runRenderLoop);
-            }
-          };
-          update.animationFrameId = requestAnimationFrame(runRenderLoop);
-        }
+        // 3. 申请硬件级 rAF 渲染调度（合并原子提交）
+        scheduleRAFUpdate(actualMessageId);
       }
-      msg!.isThinking = false;
-      addSessionStream(itemId, topicId, actualMessageId);
     } else if (type === "end" || type === "error") {
       const errorMsg = event.error;
       const finishReason = event.finishReason;
@@ -388,6 +470,9 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           removeSessionStream(itemId, topicId, actualMessageId);
           if (callbacks?.onStreamFinished) {
             callbacks.onStreamFinished(actualMessageId, topicId);
+          }
+          if (typeof navigator !== "undefined" && navigator.vibrate) {
+            navigator.vibrate(40);
           }
         };
 
@@ -492,11 +577,194 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     rAFPendingUpdates.clear();
   });
 
+  const isRecovering = ref(false);
+
+  /**
+   * 检查并恢复被异常打断的活跃生成（冷启动自对齐与流接续）
+   */
+  const checkAndRecoverInterruptedStreams = async () => {
+    if (isRecovering.value) return;
+
+    // 1. 本地扫表：无网状态下也能运行
+    let activeGens: any[] = [];
+    try {
+      activeGens = await invoke<any[]>("get_active_generations");
+    } catch (e) {
+      console.error("[ChatStreamStore] Failed to get active generations:", e);
+      return;
+    }
+
+    if (!activeGens || activeGens.length === 0) return;
+
+    console.log(`[ChatStreamStore] Found ${activeGens.length} interrupted active generations:`, activeGens);
+
+    // 2. UI 预处理：在内存中将消息标记为 reconnecting，让用户在界面上看到“重连中”
+    for (const gen of activeGens) {
+      const { msgId, topicId, ownerId, owner_type: ownerType } = gen;
+      
+      let msg = activeStreamMessages.get(msgId);
+      if (!msg) {
+        const historyStore = useChatHistoryStore();
+        const existingMsg = historyStore.currentChatHistory.find(x => x.id === msgId);
+        
+        if (existingMsg) {
+          msg = existingMsg;
+          msg.isReconnecting = true;
+        } else {
+          msg = reactive<ChatMessage>({
+            id: msgId,
+            role: "assistant",
+            name: undefined,
+            content: "",
+            timestamp: gen.createdAt || Date.now(),
+            isThinking: false,
+            isReconnecting: true,
+            agentId: ownerType === "agent" ? ownerId : undefined,
+            groupId: ownerType === "group" ? ownerId : undefined,
+            isGroupMessage: ownerType === "group",
+            shell: computeShell({ role: "assistant", agentId: ownerType === "agent" ? ownerId : undefined }),
+          });
+          
+          // 如果是当前展示的话题，且历史中没有，立即推入历史中展示
+          if (topicId === sessionStore.currentTopicId) {
+            historyStore.currentChatHistory.push(msg);
+            historyStore.currentChatHistory.sort((a, b) => a.timestamp - b.timestamp);
+          }
+        }
+        activeStreamMessages.set(msgId, msg);
+      } else {
+        msg.isReconnecting = true;
+      }
+      addSessionStream(ownerId, topicId, msgId);
+    }
+
+    // 3. 网络请求 Gate 门控
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+      console.log("[ChatStreamStore] Network offline. Suspending active generations cloud sync.");
+      return;
+    }
+
+    isRecovering.value = true;
+    try {
+      for (const gen of activeGens) {
+        const { msgId, topicId, ownerId, owner_type: ownerType } = gen;
+        
+        const isWarm = activeStreamMessages.has(msgId);
+        let msg = activeStreamMessages.get(msgId);
+        const originalContent = msg?.content || "";
+        const originalBlocks = msg?.blocks ? [...msg.blocks] : [];
+
+        if (!msg) {
+          // 说明是冷启动后第一次加载或者流不在活跃池中
+          const historyStore = useChatHistoryStore();
+          const existing = historyStore.currentChatHistory.find((x) => x.id === msgId);
+          if (existing) {
+            msg = existing;
+            activeStreamMessages.set(msgId, msg);
+          }
+        }
+
+        const res = await invoke<any>("recover_active_generation", { msgId });
+        console.log(`[ChatStreamStore] Recovery status for ${msgId}:`, res);
+
+        if (res.status === "streaming") {
+          // 云端仍在生成，开启接续
+          if (msg) {
+            msg.isReconnecting = false;
+            msg.isThinking = false;
+            
+            if (!isWarm) {
+              // 🆕 冷接续：内存 AST 状态已丢，必须清空并由本地 TCP 从 0 回放重建，防止 AST 渲染器崩溃
+              msg.content = "";
+              msg.blocks = [];
+            }
+          }
+
+          const streamChannel = new Channel<any>();
+          streamChannel.onmessage = (event) => processStreamEvent(event, {
+            onMessageCreated: (m, tid) => {
+              const historyStore = useChatHistoryStore();
+              if (tid === sessionStore.currentTopicId && !historyStore.currentChatHistory.some(x => x.id === m.id)) {
+                historyStore.currentChatHistory.push(m);
+                historyStore.currentChatHistory.sort((a, b) => a.timestamp - b.timestamp);
+              }
+            },
+            onStreamFinished: (_mid, tid) => {
+              if (tid === sessionStore.currentTopicId) {
+                const historyStore = useChatHistoryStore();
+                historyStore.summarizeTopic();
+              }
+            }
+          });
+
+          // 唤醒流接续 (在 Rust 侧执行)
+          // 如果是温接续 (isWarm = true)，从 res.lastEventIndex 开始接续
+          // 如果是冷接续 (isWarm = false)，从 0 开始回放 (lastEventIndex = null)
+          const lastEventIndex = isWarm && res.lastEventIndex !== undefined && res.lastEventIndex !== null
+            ? res.lastEventIndex
+            : null;
+
+          invoke("resume_stream", {
+            msgId,
+            topicId,
+            ownerId,
+            ownerType,
+            streamChannel,
+            initialContent: isWarm ? (res.content || "") : null,
+            lastEventIndex,
+          }).catch(err => {
+            console.error(`[ChatStreamStore] Failed to resume stream for ${msgId}:`, err);
+            if (msg) {
+              msg.isReconnecting = false;
+              msg.finishReason = "error";
+              // 恢复原始内容，并追加错误标记，防止接续失败时内容被清空
+              msg.content = originalContent + "\n\n> VCP流式错误: 接续失败";
+              msg.blocks = originalBlocks;
+            }
+            removeSessionStream(ownerId, topicId, msgId);
+          });
+        } else {
+          // completed 或 failed
+          if (msg) {
+            msg.isReconnecting = false;
+            msg.isThinking = false;
+            msg.content = res.content || "";
+            
+            // 编译 blocks 以便立即在 UI 上高质量渲染，避免整页 reload 闪烁
+            invoke<any>("process_message_content", {
+              content: msg.content,
+            }).then((compiledBlocks) => {
+              msg.blocks = compiledBlocks;
+            }).catch((e) => {
+              console.error("[ChatStreamStore] Failed to compile blocks for recovered message:", e);
+            });
+          }
+          removeSessionStream(ownerId, topicId, msgId);
+          
+          // 如果当前正处于该话题，且历史列表中确实没有这个消息，才进行重载
+          if (topicId === sessionStore.currentTopicId) {
+            const historyStore = useChatHistoryStore();
+            if (!historyStore.currentChatHistory.some(x => x.id === msgId)) {
+              historyStore.loadHistory(ownerId, ownerType, topicId);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error("[ChatStreamStore] Cloud sync failed during recovery:", e);
+    } finally {
+      isRecovering.value = false;
+    }
+  };
+
   return {
     streamingMessageId,
     sessionActiveStreams,
     activeStreamMessages,
     activeStreamingIds,
+    activeStreamIdSet,
+    isMessageActive,
+    isMessageActiveInSession,
     isGroupGenerating,
     computeShell,
     addSessionStream,
@@ -504,6 +772,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     processStreamEvent,
     stopMessage,
     stopGroupTurn,
+    checkAndRecoverInterruptedStreams,
   };
 });
 
