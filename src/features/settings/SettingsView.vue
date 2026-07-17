@@ -50,6 +50,7 @@ const settings = ref<AppSettings>({
   syncServerUrl: "",
   syncHttpUrl: "",
   syncToken: "",
+  syncDeviceId: "",
   adminUsername: "",
   adminPassword: "",
   fileKey: "",

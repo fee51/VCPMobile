@@ -12,6 +12,10 @@ fn default_sync_log_level() -> String {
     "INFO".to_string()
 }
 
+fn default_sync_device_id() -> String {
+    format!("mobile-{}", uuid::Uuid::new_v4().simple())
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -45,6 +49,8 @@ pub struct Settings {
     pub sync_http_url: String, // HTTP API 服务 URL (http://ip:port)
     #[serde(default)]
     pub sync_token: String,
+    #[serde(default = "default_sync_device_id")]
+    pub sync_device_id: String,
 
     // 管理接口鉴权 (用于表情包刷新等)
     #[serde(default)]
@@ -117,6 +123,7 @@ pub fn create_default_settings() -> Settings {
         sync_server_url: "".to_string(),
         sync_http_url: "".to_string(),
         sync_token: "".to_string(),
+        sync_device_id: default_sync_device_id(),
         admin_username: "".to_string(),
         admin_password: "".to_string(),
         file_key: "".to_string(),
@@ -149,13 +156,38 @@ pub async fn read_settings<R: Runtime>(
         .await
         .map_err(|e| e.to_string())?;
 
-    let settings = if let Some(row) = row_res {
+    let (settings, should_persist) = if let Some(row) = row_res {
         use sqlx::Row;
         let content: String = row.get("value");
-        serde_json::from_str(&content).unwrap_or_else(|_| create_default_settings())
+        let had_device_id = serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("syncDeviceId")
+                    .and_then(|id| id.as_str())
+                    .map(|id| !id.trim().is_empty())
+            })
+            .unwrap_or(false);
+        (
+            serde_json::from_str(&content).unwrap_or_else(|_| create_default_settings()),
+            !had_device_id,
+        )
     } else {
-        create_default_settings()
+        (create_default_settings(), true)
     };
+
+    if should_persist {
+        let content = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+        let now = crate::vcp_modules::infra::utils::now_millis();
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('global', ?, ?)",
+        )
+        .bind(content)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
 
     *state.cache.lock().await = Some(settings.clone());
     Ok(settings)

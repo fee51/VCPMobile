@@ -21,12 +21,20 @@ const EXPECTED_PLUGIN_VERSION: &str = "1.0.0";
 const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct SyncState {
-    pub ws_sender: mpsc::UnboundedSender<SyncCommand>,
+    pub ws_sender: Arc<std::sync::RwLock<mpsc::UnboundedSender<SyncCommand>>>,
     pub connection_status: Arc<RwLock<String>>,
     pub uploaded_hashes: Arc<RwLock<HashSet<String>>>,
     pub is_syncing: Arc<std::sync::atomic::AtomicBool>,
     pub current_log_path: Arc<RwLock<Option<String>>>,
     pub current_logger: Arc<std::sync::RwLock<Option<Arc<std::sync::Mutex<SyncLogger>>>>>,
+}
+
+impl SyncState {
+    pub fn send_sync_command(&self, command: SyncCommand) {
+        if let Ok(sender) = self.ws_sender.read() {
+            let _ = sender.send(command);
+        }
+    }
 }
 
 /// 追踪 Phase 3 中已处理完成的 topic，替代 AtomicU32 避免双重递减下溢
@@ -190,7 +198,7 @@ async fn publish_sync_status<R: Runtime>(
 pub fn init_sync_service(_app_handle: AppHandle) -> SyncState {
     let (tx, _rx) = mpsc::unbounded_channel::<SyncCommand>();
     SyncState {
-        ws_sender: tx,
+        ws_sender: Arc::new(std::sync::RwLock::new(tx)),
         connection_status: Arc::new(RwLock::new(String::from("disconnected"))),
         uploaded_hashes: Arc::new(RwLock::new(HashSet::new())),
         is_syncing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -345,9 +353,22 @@ async fn run_sync_session(
     let tx_internal = tx.clone();
     let connection_status_for_task = connection_status.clone();
 
-    let http_client = reqwest::Client::new();
+    let initial_settings = crate::vcp_modules::settings_manager::read_settings(
+        handle_clone.clone(),
+        handle_clone.state(),
+    )
+    .await
+    .unwrap_or_default();
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    if let Ok(device_id) = reqwest::header::HeaderValue::from_str(&initial_settings.sync_device_id)
+    {
+        default_headers.insert("x-device-id", device_id);
+    }
+    let http_client = reqwest::Client::builder()
+        .default_headers(default_headers)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let mut retry_count = 0u32;
-    const MAX_RETRIES: u32 = 3;
     let mut retry_delay = Duration::from_millis(500);
 
     let db = app_handle.state::<DbState>();
@@ -413,7 +434,7 @@ async fn run_sync_session(
         {
             break;
         }
-        let (ws_url, http_url) = {
+        let (ws_url, http_url, device_id) = {
             let settings_state =
                 handle_clone.state::<crate::vcp_modules::settings_manager::SettingsState>();
             match crate::vcp_modules::settings_manager::read_settings(
@@ -436,7 +457,10 @@ async fn run_sync_session(
                     }
                     let ws_addr = match url::Url::parse(&s.sync_server_url) {
                         Ok(mut u) => {
-                            u.set_query(Some(&format!("token={}", s.sync_token)));
+                            u.query_pairs_mut()
+                                .clear()
+                                .append_pair("token", &s.sync_token)
+                                .append_pair("deviceId", &s.sync_device_id);
                             u.to_string()
                         }
                         Err(e) => {
@@ -455,7 +479,7 @@ async fn run_sync_session(
                             break;
                         }
                     };
-                    (ws_addr, s.sync_http_url.clone())
+                    (ws_addr, s.sync_http_url.clone(), s.sync_device_id.clone())
                 }
                 Err(_) => {
                     emit_sync_log(&handle_clone, "error", "无法读取同步配置");
@@ -553,7 +577,7 @@ async fn run_sync_session(
                                         plugin_version, EXPECTED_PLUGIN_VERSION
                                     ),
                                 );
-                                emit_sync_log(&handle_clone, "error", "👉 排查建议: 请前往 https://github.com/MRiecy/VCPMobile/releases 下载最新同步插件");
+                                emit_sync_log(&handle_clone, "error", "👉 排查建议: 请前往 https://github.com/fee51/VCPMobile/releases 下载最新同步插件");
                                 break;
                             }
                         }
@@ -743,8 +767,9 @@ async fn run_sync_session(
                 let manifest_responses_received = Arc::new(AtomicU32::new(0));
                 // 1: 基础 Metadata (agent, group, avatar), 2: Topic Metadata
                 let manifest_phase = Arc::new(AtomicU8::new(1));
+                let mut sync_cycle_active = false;
+                let mut sync_cycle_pending = false;
                 let mut fatal_error = false;
-                let mut sync_success = false;
                 let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(15));
 
                 loop {
@@ -916,10 +941,12 @@ async fn run_sync_session(
                                         json!({ "status": "completed", "message": "同步完成", "source": "Sync" }),
                                     );
 
-                                    sync_success = true;
                                     let _ = ws_stream.send(Message::Text(json!({ "type": "PHASE_COMPLETED" }).to_string().into())).await;
-                                    let _ = ws_stream.close(None).await;
-                                    break;
+                                    sync_cycle_active = false;
+                                    if sync_cycle_pending {
+                                        sync_cycle_pending = false;
+                                        let _ = tx_internal.send(SyncCommand::StartManualSync);
+                                    }
                                 },
                             }
                         },
@@ -932,6 +959,11 @@ async fn run_sync_session(
                                 SyncCommand::NotifyLocalChange { id, data_type, hash, ts } => {
                                     let msg = json!({ "type": "SYNC_ENTITY_UPDATE", "id": id, "dataType": data_type, "hash": hash, "ts": ts });
                                     let _ = ws_stream.send(Message::Text(msg.to_string().into())).await;
+                                    if sync_cycle_active {
+                                        sync_cycle_pending = true;
+                                    } else {
+                                        let _ = tx_internal.send(SyncCommand::StartManualSync);
+                                    }
                                 },
                                 SyncCommand::StartTopicMetadata => {
                                     let should_flush = {
@@ -1012,8 +1044,28 @@ async fn run_sync_session(
                                 SyncCommand::NotifyDelete { data_type, id } => {
                                     let msg = json!({ "type": "SYNC_ENTITY_DELETE", "id": id, "dataType": data_type });
                                     let _ = ws_stream.send(Message::Text(msg.to_string().into())).await;
+                                    if sync_cycle_active {
+                                        sync_cycle_pending = true;
+                                    } else {
+                                        let _ = tx_internal.send(SyncCommand::StartManualSync);
+                                    }
                                 },
                                 SyncCommand::StartManualSync => {
+                                    if sync_cycle_active {
+                                        continue;
+                                    }
+                                    sync_cycle_active = true;
+                                    if let Ok(mut gate) = phase_gate.lock() {
+                                        gate.clear();
+                                    }
+                                    {
+                                        let mut owners = changed_owners.lock().await;
+                                        owners.clear();
+                                    }
+                                    {
+                                        let mut topics = changed_topics.lock().await;
+                                        topics.clear();
+                                    }
                                     let db = handle_clone.state::<DbState>();
                                     manifest_phase.store(1, Ordering::SeqCst);
                                     if let Ok(manifests) = Phase1Metadata::build_phase1_manifests(&db.pool).await {
@@ -1056,6 +1108,17 @@ async fn run_sync_session(
                                 let settings = crate::vcp_modules::settings_manager::read_settings(h.clone(), h.state()).await.unwrap_or_default();
 
                                 match payload["type"].as_str() {
+                                    Some("REMOTE_CHANGE_AVAILABLE") => {
+                                        let source_device_id = payload["sourceDeviceId"].as_str().unwrap_or_default();
+                                        if source_device_id != device_id {
+                                            if sync_cycle_active {
+                                                sync_cycle_pending = true;
+                                            } else {
+                                                emit_sync_log(&handle_clone, "info", "检测到其他设备更新，开始自动同步");
+                                                let _ = tx_internal.send(SyncCommand::StartManualSync);
+                                            }
+                                        }
+                                    },
                                     Some("SYNC_ENTITY_UPDATE") => {
                                         let id = payload["id"].as_str().unwrap_or_default().to_string();
                                         let owner_type = payload["ownerType"].as_str().unwrap_or("agent").to_string();
@@ -1253,7 +1316,11 @@ async fn run_sync_session(
                         else => break,
                     }
                 }
-                if sync_success {
+                if !handle_clone
+                    .state::<SyncState>()
+                    .is_syncing
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
                     break; // 同步完成，退出外层 loop
                 } else {
                     if fatal_error {
@@ -1261,21 +1328,10 @@ async fn run_sync_session(
                     }
                     // 同步未成功完成，但内层循环已跳出（说明中途断网）
                     retry_count += 1;
-                    if retry_count >= MAX_RETRIES {
-                        let err_msg = "同步中途异常断开，已达到最大重试次数";
-                        publish_sync_status(
-                            &handle_clone,
-                            &connection_status_for_task,
-                            "error",
-                            err_msg,
-                        )
-                        .await;
-                        break;
-                    }
-                    let backoff = retry_delay * 2u32.pow(retry_count - 1);
+                    let backoff = Duration::from_secs((1u64 << retry_count.min(5)).min(30));
                     let err_msg = format!(
-                        "同步中途异常断开，{:?} 后尝试重新连接... (次数: {}/{})",
-                        backoff, retry_count, MAX_RETRIES
+                        "同步连接中断，{:?} 后自动重新连接... (第 {} 次)",
+                        backoff, retry_count
                     );
                     emit_sync_log(&handle_clone, "warn", &err_msg);
                     if !handle_clone
@@ -1302,7 +1358,7 @@ async fn run_sync_session(
                     || diagnosis.error_code == "TOKEN_MISMATCH"
                     || diagnosis.error_code == "WS_PATH_INVALID";
 
-                if is_fatal || retry_count >= MAX_RETRIES {
+                if is_fatal {
                     emit_sync_log(
                         &handle_clone,
                         "error",
@@ -1333,7 +1389,7 @@ async fn run_sync_session(
                 }
 
                 let warn_msg = format!(
-                    "连接失败，第 {} 次重试 | {} ({})",
+                    "连接失败，将持续自动重试 (第 {} 次) | {} ({})",
                     retry_count + 1,
                     diagnosis.error_message,
                     diagnosis.error_code
@@ -1356,7 +1412,7 @@ async fn run_sync_session(
                 {
                     break;
                 }
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
             }
         }
     }
@@ -1462,7 +1518,7 @@ pub async fn stop_sync(state: State<'_, SyncState>) -> Result<(), String> {
         let mut guard = state.connection_status.write().await;
         *guard = "disconnected".to_string();
     }
-    let _ = state.ws_sender.send(SyncCommand::Cancel);
+    state.send_sync_command(SyncCommand::Cancel);
     Ok(())
 }
 
@@ -1476,6 +1532,11 @@ pub async fn start_manual_sync(
     handle: AppHandle,
     state: State<'_, SyncState>,
 ) -> Result<(), String> {
+    if state.is_syncing.load(std::sync::atomic::Ordering::SeqCst) {
+        state.send_sync_command(SyncCommand::StartManualSync);
+        return Ok(());
+    }
+
     if state
         .is_syncing
         .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -1493,6 +1554,9 @@ pub async fn start_manual_sync(
     }
 
     let (tx, rx) = mpsc::unbounded_channel::<SyncCommand>();
+    if let Ok(mut sender) = state.ws_sender.write() {
+        *sender = tx.clone();
+    }
 
     let app_handle = handle.clone();
     let connection_status = state.connection_status.clone();
@@ -1507,6 +1571,11 @@ pub async fn start_manual_sync(
     tx_cmd
         .send(SyncCommand::StartManualSync)
         .map_err(|e| e.to_string())
+}
+
+pub async fn start_sync_internal(handle: AppHandle) -> Result<(), String> {
+    let state = handle.state::<SyncState>();
+    start_manual_sync(handle.clone(), state).await
 }
 
 #[derive(Debug, serde::Serialize)]

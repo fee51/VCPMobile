@@ -206,7 +206,7 @@ const processNotificationClick = (detail: any) => {
   while (modalStackLength() > 0) {
     closeTopModal();
   }
-  
+
   // 2. 关闭侧边栏
   layoutStore.setLeftDrawer(false);
   layoutStore.setRightDrawer(false);
@@ -331,7 +331,6 @@ const handleExitRequest = async () => {
     }, 2000);
   }
 };
-
 
 
 

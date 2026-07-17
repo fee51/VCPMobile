@@ -9,9 +9,9 @@ use tokio::io::AsyncWriteExt;
 
 const FRONTEND_DIST_PREFIX: &str = "frontend-dist-v";
 const FRONTEND_DIST_SUFFIX: &str = ".zip";
-const GITHUB_API_LATEST_URL: &str = "https://api.github.com/repos/MRiecy/VCPMobile/releases/latest";
+const GITHUB_API_LATEST_URL: &str = "https://api.github.com/repos/fee51/VCPMobile/releases/latest";
 const GITHUB_API_LIST_URL: &str =
-    "https://api.github.com/repos/MRiecy/VCPMobile/releases?per_page=1";
+    "https://api.github.com/repos/fee51/VCPMobile/releases?per_page=1";
 
 /// 前端更新包元信息
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -114,8 +114,8 @@ VCP Mobile 采用**双轨 OTA（Over-The-Air，空中下载技术）**更新策�
 
 | 优先级 | 端点 | 适用场景 | 响应体 |
 |--------|------|----------|--------|
-| 1 | `GET /repos/MRiecy/VCPMobile/releases/latest` | 最新 Release 为正式版（非 prerelease） | 单个 `GitHubRelease` JSON |
-| 2 | `GET /repos/MRiecy/VCPMobile/releases?per_page=1` | `/latest` 返回 404（最新为 prerelease） | `Vec<GitHubRelease>` 取首个 |
+| 1 | `GET /repos/fee51/VCPMobile/releases/latest` | 最新 Release 为正式版（非 prerelease） | 单个 `GitHubRelease` JSON |
+| 2 | `GET /repos/fee51/VCPMobile/releases?per_page=1` | `/latest` 返回 404（最新为 prerelease） | `Vec<GitHubRelease>` 取首个 |
 
 > 注：GitHub 的 `/releases/latest` 端点**仅返回最新的正式 Release**。如果仓库最新发布的是 prerelease，该端点会返回 404，此时降级到列表端点取第一个（即时间最新的 Release，无论是否 prerelease）。
 

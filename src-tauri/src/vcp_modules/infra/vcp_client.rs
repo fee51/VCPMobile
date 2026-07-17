@@ -105,6 +105,50 @@ impl StreamEvent {
     }
 }
 
+fn sse_data_payload(line: &str) -> Option<&str> {
+    line.trim_start().strip_prefix("data:").map(str::trim_start)
+}
+
+fn extract_stream_text(chunk: &Value) -> String {
+    let mut text = String::new();
+
+    if let Some(choice) = chunk["choices"]
+        .as_array()
+        .and_then(|choices| choices.first())
+    {
+        let content = &choice["delta"]["content"];
+        if let Some(value) = content.as_str() {
+            text.push_str(value);
+        } else if let Some(parts) = content.as_array() {
+            for part in parts {
+                if let Some(value) = part.as_str() {
+                    text.push_str(value);
+                } else if let Some(value) = part["text"].as_str() {
+                    text.push_str(value);
+                }
+            }
+        }
+
+        if text.is_empty() {
+            if let Some(value) = choice["message"]["content"].as_str() {
+                text.push_str(value);
+            } else if let Some(value) = choice["text"].as_str() {
+                text.push_str(value);
+            }
+        }
+    }
+
+    if text.is_empty() {
+        if let Some(value) = chunk["delta"].as_str() {
+            text.push_str(value);
+        } else if let Some(value) = chunk["content"].as_str() {
+            text.push_str(value);
+        }
+    }
+
+    text
+}
+
 /// 全局活跃请求管理器，使用 DashMap 存储中止信号发送端
 /// messageId -> oneshot::Sender
 pub struct ActiveRequests(pub Arc<DashMap<String, oneshot::Sender<()>>>);
@@ -1113,11 +1157,23 @@ async fn handle_streaming_request<R: Runtime>(
                                                         break;
                                                     }
                                                     if let Ok(data_val) = serde_json::from_str::<Value>(event_data) {
-                                                        if let Some(reason) = data_val.get("finish_reason").and_then(|r| r.as_str()) {
+                                                        if let Some(reason) = data_val
+                                                            .get("finish_reason")
+                                                            .and_then(|r| r.as_str())
+                                                            .or_else(|| {
+                                                                data_val
+                                                                    .get("choices")
+                                                                    .and_then(|c| c.as_array())
+                                                                    .and_then(|a| a.first())
+                                                                    .and_then(|choice| choice.get("finish_reason"))
+                                                                    .and_then(|r| r.as_str())
+                                                            })
+                                                        {
                                                             last_finish_reason = Some(reason.to_string());
                                                         }
-                                                        if let Some(delta) = data_val.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|o| o.get("delta")).and_then(|d| d.get("content")).and_then(|s| s.as_str()) {
-                                                            pending_aurora_chunk.push_str(delta);
+                                                        let text_chunk = extract_stream_text(&data_val);
+                                                        if !text_chunk.is_empty() {
+                                                            pending_aurora_chunk.push_str(&text_chunk);
                                                             let (stable_changed, tail_changed) = flush_aurora_parse(
                                                                 &mut aurora_buffer,
                                                                 &mut pending_aurora_chunk,
@@ -1187,18 +1243,29 @@ async fn handle_streaming_request<R: Runtime>(
                                 next_line = line_stream.next() => {
                                     match next_line {
                                         Some(Ok(line)) => {
-                                            if let Some(stripped) = line.strip_prefix("data:") {
-                                                let data_content = stripped.trim();
+                                            if let Some(data_content) = sse_data_payload(&line) {
+                                                let data_content = data_content.trim();
                                                 if data_content == "[DONE]" {
                                                     stream_ended_normally = true;
                                                     break;
                                                 }
                                                 if let Ok(val) = serde_json::from_str::<Value>(data_content) {
-                                                    if let Some(reason) = val.get("finish_reason").and_then(|r| r.as_str()) {
+                                                    if let Some(reason) = val
+                                                        .get("finish_reason")
+                                                        .and_then(|r| r.as_str())
+                                                        .or_else(|| {
+                                                            val.get("choices")
+                                                                .and_then(|c| c.as_array())
+                                                                .and_then(|a| a.first())
+                                                                .and_then(|choice| choice.get("finish_reason"))
+                                                                .and_then(|r| r.as_str())
+                                                        })
+                                                    {
                                                         last_finish_reason = Some(reason.to_string());
                                                     }
-                                                    if let Some(delta) = val.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|o| o.get("delta")).and_then(|d| d.get("content")).and_then(|s| s.as_str()) {
-                                                        pending_aurora_chunk.push_str(delta);
+                                                    let text_chunk = extract_stream_text(&val);
+                                                    if !text_chunk.is_empty() {
+                                                        pending_aurora_chunk.push_str(&text_chunk);
                                                         let (stable_changed, tail_changed) = flush_aurora_parse(
                                                             &mut aurora_buffer,
                                                             &mut pending_aurora_chunk,
@@ -1469,6 +1536,38 @@ async fn handle_non_streaming_request(
         }),
         false,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_stream_text, sse_data_payload};
+    use serde_json::json;
+
+    #[test]
+    fn accepts_sse_data_with_or_without_space() {
+        assert_eq!(sse_data_payload("data: hello"), Some("hello"));
+        assert_eq!(sse_data_payload("data:hello"), Some("hello"));
+        assert_eq!(sse_data_payload("  data: hello"), Some("hello"));
+        assert_eq!(sse_data_payload("event: message"), None);
+    }
+
+    #[test]
+    fn extracts_common_stream_content_shapes() {
+        assert_eq!(
+            extract_stream_text(&json!({"choices":[{"delta":{"content":"hello"}}]})),
+            "hello"
+        );
+        assert_eq!(
+            extract_stream_text(
+                &json!({"choices":[{"delta":{"content":[{"type":"text","text":"hi"}]}}]})
+            ),
+            "hi"
+        );
+        assert_eq!(
+            extract_stream_text(&json!({"delta":"response-api"})),
+            "response-api"
+        );
+    }
 }
 
 async fn load_app_settings<R: Runtime>(app: &AppHandle<R>) -> Result<Settings, String> {

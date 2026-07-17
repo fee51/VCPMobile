@@ -1,0 +1,90 @@
+name: Build Sync APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cloud-sync
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Android debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      NDK_VERSION: "29.0.13846066"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            src-tauri -> src-tauri/target
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;${NDK_VERSION}"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm exec vue-tsc --noEmit
+
+      - name: Build arm64 debug APK
+        env:
+          NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.NDK_VERSION }}
+        run: pnpm tauri android build --debug --apk --target aarch64
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          apk=$(find src-tauri/gen/android/app/build/outputs/apk -name "*-debug.apk" -type f | head -n 1)
+          test -n "$apk"
+          cp "$apk" artifacts/VCPMobile-cloud-sync-arm64-debug.apk
+          sha256sum artifacts/VCPMobile-cloud-sync-arm64-debug.apk > artifacts/SHA256SUMS.txt
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCPMobile-cloud-sync-arm64-debug
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30

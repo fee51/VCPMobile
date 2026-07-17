@@ -477,7 +477,7 @@ Release 工作流环境：Node 22, pnpm 10, Java 17 (temurin), Android NDK `29.0
 
 ### 7.1 用户安装（普通用户）
 
-1. 前往 [Releases](https://github.com/MRiecy/VCPMobile/releases) 下载最新 `VCPMobile_v1.1.3_arm64-v8a.apk`
+1. 前往 [Releases](https://github.com/fee51/VCPMobile/releases) 下载最新 `VCPMobile_v1.1.3_arm64-v8a.apk`
 2. 安装到 Android 设备（minSdk 26，推荐 Android 10+）
 3. 启动应用，完成权限引导（通知、存储、电池优化白名单）
 4. 配置 VCP 服务器地址与 API Key
@@ -497,7 +497,7 @@ Release 工作流环境：Node 22, pnpm 10, Java 17 (temurin), Android NDK `29.0
 
 ```bash
 # 1. Clone
-git clone https://github.com/MRiecy/VCPMobile.git
+git clone https://github.com/fee51/VCPMobile.git
 cd VCPMobile
 
 # 2. Install dependencies

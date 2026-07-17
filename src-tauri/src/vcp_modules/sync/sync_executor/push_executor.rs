@@ -362,6 +362,14 @@ async fn build_message_dtos<R: Runtime>(
     let mut results = Vec::new();
 
     for msg in history {
+        if !should_upload_message(&msg.role, &msg.content) {
+            log::warn!(
+                "[PushExecutor] Skipping empty assistant placeholder during sync: message_id={}",
+                msg.id
+            );
+            continue;
+        }
+
         let msg_value = if msg.role == "user" {
             let dto = UserMessageSyncDTO::from(msg);
             serde_json::to_value(dto).ok()
@@ -387,6 +395,10 @@ async fn build_message_dtos<R: Runtime>(
     }
 
     results
+}
+
+fn should_upload_message(role: &str, content: &str) -> bool {
+    role == "user" || !content.trim().is_empty()
 }
 
 async fn upload_attachment<R: Runtime>(
@@ -447,4 +459,21 @@ async fn upload_attachment<R: Runtime>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_upload_message;
+
+    #[test]
+    fn skips_empty_assistant_placeholders() {
+        assert!(!should_upload_message("assistant", ""));
+        assert!(!should_upload_message("assistant", "  \n\t"));
+    }
+
+    #[test]
+    fn keeps_completed_assistant_and_user_messages() {
+        assert!(should_upload_message("assistant", "reply"));
+        assert!(should_upload_message("user", ""));
+    }
 }

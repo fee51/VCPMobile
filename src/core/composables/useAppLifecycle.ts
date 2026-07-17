@@ -1,5 +1,6 @@
 import { onMounted, onUnmounted, watch } from 'vue';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import { useAppLifecycleStore } from '../stores/appLifecycle';
 import { useChatStreamStore } from '../stores/chatStreamStore';
 
@@ -57,6 +58,9 @@ export function useAppLifecycle() {
           lifecycleStore.isBackground = true;
         } else if (state === 'resume') {
           lifecycleStore.isBackground = false;
+          invoke('start_manual_sync').catch(err => {
+            console.error('[useAppLifecycle] Failed to resume automatic sync:', err);
+          });
           streamStore.checkAndRecoverInterruptedStreams().catch(err => {
             console.error("[useAppLifecycle] Failed to recover streams on resume:", err);
           });
