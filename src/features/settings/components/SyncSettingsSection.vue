@@ -66,6 +66,13 @@ const rebuildEmoticonLibrary = async () => {
       placeholder="输入桌面端 config.env 中的 Token"
       mono
     />
+    <SettingsTextField
+      v-model="settings.syncDeviceId"
+      label="同步设备 ID"
+      placeholder="首次启动自动生成"
+      mono
+      readonly
+    />
 
     <div class="border-t border-black/5 dark:border-white/5 pt-2 space-y-4">
       <SettingsTextField

@@ -406,6 +406,10 @@ async fn send_entity_items(
     Ok(())
 }
 
+fn should_upload_message(role: &str, content: &str) -> bool {
+    role == "user" || !content.trim().is_empty()
+}
+
 async fn load_outbound_message_page(
     tx: &mut Transaction<'_, Sqlite>,
     key: &TopicKey,
@@ -660,6 +664,14 @@ async fn serialize_topic_messages(
                 )
             })?;
             let next_cursor = (timestamp, message.id.clone());
+            if !should_upload_message(&message.role, &message.content) {
+                log::warn!(
+                    "[PushExecutor] Skipping empty assistant placeholder during sync: message_id={}",
+                    message.id
+                );
+                cursor = Some(next_cursor);
+                continue;
+            }
             if serialized_count > 0 {
                 line.write_all(b",").map_err(|error| {
                     format!("Message push separator failed for {topic_id}: {error}")
@@ -1087,6 +1099,18 @@ mod tests {
 
     fn topic(topic_id: &str) -> TopicKey {
         TopicKey::new("agent", "agent-a", topic_id)
+    }
+
+    #[test]
+    fn skips_empty_assistant_placeholders() {
+        assert!(!should_upload_message("assistant", ""));
+        assert!(!should_upload_message("assistant", "  \n\t"));
+    }
+
+    #[test]
+    fn keeps_completed_assistant_and_user_messages() {
+        assert!(should_upload_message("assistant", "reply"));
+        assert!(should_upload_message("user", ""));
     }
 
     #[test]

@@ -13,6 +13,10 @@ fn default_sync_log_level() -> String {
     "INFO".to_string()
 }
 
+fn default_sync_device_id() -> String {
+    format!("mobile-{}", uuid::Uuid::new_v4().simple())
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -46,6 +50,8 @@ pub struct Settings {
     pub sync_http_url: String, // HTTP API 服务 URL (http://ip:port)
     #[serde(default)]
     pub sync_token: String,
+    #[serde(default = "default_sync_device_id")]
+    pub sync_device_id: String,
 
     // 管理接口鉴权 (用于表情包刷新等)
     #[serde(default)]
@@ -171,6 +177,7 @@ pub fn create_default_settings() -> Settings {
         sync_server_url: "".to_string(),
         sync_http_url: "".to_string(),
         sync_token: "".to_string(),
+        sync_device_id: default_sync_device_id(),
         admin_username: "".to_string(),
         admin_password: "".to_string(),
         file_key: "".to_string(),
@@ -211,18 +218,47 @@ async fn read_settings_locked<R: Runtime>(
         .await
         .map_err(|e| e.to_string())?;
 
-    let settings = if let Some(row) = row_res {
+    let (mut settings, raw_content) = if let Some(row) = row_res {
         use sqlx::Row;
         let content: String = row.get("value");
-        match serde_json::from_str(&content) {
+        let settings = match serde_json::from_str(&content) {
             Ok(settings) => settings,
             Err(parse_error) => {
                 recover_corrupt_settings(pool, state, &content, &parse_error.to_string()).await?
             }
-        }
+        };
+        (settings, Some(content))
     } else {
-        create_default_settings()
+        (create_default_settings(), None)
     };
+
+    let had_device_id = raw_content
+        .as_deref()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+        .and_then(|value| {
+            value
+                .get("syncDeviceId")
+                .and_then(|id| id.as_str())
+                .map(|id| !id.trim().is_empty())
+        })
+        .unwrap_or(false);
+
+    if settings.sync_device_id.trim().is_empty() {
+        settings.sync_device_id = default_sync_device_id();
+    }
+
+    if !had_device_id {
+        let content = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+        let now = crate::vcp_modules::infra::utils::now_millis();
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('global', ?, ?)",
+        )
+        .bind(content)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
 
     *state.cache.lock().await = Some(settings.clone());
     Ok(settings)
@@ -431,6 +467,11 @@ mod tests {
                 .get("enableVcpToolInjection")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+        assert!(
+            legacy.sync_device_id.starts_with("mobile-"),
+            "missing device id should be generated: {}",
+            legacy.sync_device_id
         );
     }
 

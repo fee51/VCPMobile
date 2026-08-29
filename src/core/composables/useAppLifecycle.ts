@@ -1,4 +1,5 @@
 import { onMounted, onUnmounted, watch } from 'vue';
+import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAppLifecycleStore } from '../stores/appLifecycle';
 import { useChatStreamStore } from '../stores/chatStreamStore';
@@ -75,6 +76,9 @@ export function useAppLifecycle() {
           lifecycleStore.isBackground = true;
         } else if (state === 'resume') {
           lifecycleStore.isBackground = false;
+          invoke('start_manual_sync').catch(err => {
+            console.error('[useAppLifecycle] Failed to resume automatic sync:', err);
+          });
           // 原生 resume 可能先于 document.visibilityState 变化，显式调和一次。
           void reconcileInterruptedStreams("Native resume");
         }

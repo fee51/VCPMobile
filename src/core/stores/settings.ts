@@ -12,6 +12,7 @@ export interface AppSettings {
   syncServerUrl: string;
   syncHttpUrl: string;
   syncToken: string;
+  syncDeviceId: string;
   adminUsername: string;
   adminPassword: string;
   fileKey: string;

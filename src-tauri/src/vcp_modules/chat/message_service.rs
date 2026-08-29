@@ -799,6 +799,14 @@ pub async fn append_single_message<R: tauri::Runtime>(
     MessageRepository::upsert_message(&mut tx, &message, &key, &render_bytes, false).await?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
+    if message.role == "user" || !message.content.trim().is_empty() {
+        crate::vcp_modules::sync_service::request_background_sync(&app_handle);
+    } else {
+        log::debug!(
+            "[MessageService] Deferring sync for empty assistant placeholder: message_id={}",
+            message.id
+        );
+    }
     Ok(blocks)
 }
 
@@ -909,6 +917,7 @@ pub async fn patch_single_message<R: tauri::Runtime>(
     MessageRepository::upsert_message(&mut tx, &message, &key, &render_bytes, skip_bubble).await?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
+    crate::vcp_modules::sync_service::request_background_sync(&app_handle);
     Ok(blocks)
 }
 
@@ -1411,7 +1420,7 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
 
 #[allow(clippy::too_many_arguments)]
 async fn finalize_stream_message_inner<R: tauri::Runtime>(
-    _app_handle: AppHandle<R>,
+    app_handle: AppHandle<R>,
     pool: &sqlx::Pool<sqlx::Sqlite>,
     message_key: &MessageKey,
     full_content: String,
@@ -1429,6 +1438,13 @@ async fn finalize_stream_message_inner<R: tauri::Runtime>(
     let mut final_content = full_content;
     if is_aborted {
         final_content.push_str("\n\n> VCP流式错误: 请求已中止");
+    } else if final_content.trim().is_empty() {
+        log::error!(
+            "[StreamFinalizer] Refusing to persist an empty assistant response: message_id={}",
+            message_id
+        );
+        final_content =
+            "> VCP流式错误: 已收到回复结束信号，但没有解析到正文。请重试此消息。".to_string();
     }
 
     let is_group = owner_type == "group";
@@ -1511,6 +1527,7 @@ async fn finalize_stream_message_inner<R: tauri::Runtime>(
         let _ = chan.send(event);
     }
 
+    crate::vcp_modules::sync_service::request_background_sync(&app_handle);
     Ok(())
 }
 

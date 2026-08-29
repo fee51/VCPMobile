@@ -148,7 +148,7 @@ pub async fn get_topics_streamed(
 
 #[tauri::command]
 pub async fn create_topic(
-    _app_handle: AppHandle,
+    app_handle: AppHandle,
     db_state: State<'_, DbState>,
     owner_id: String,
     owner_type: String,
@@ -193,6 +193,8 @@ pub async fn create_topic(
     let key = TopicKey::new(&owner_type, &owner_id, &id);
     HashAggregator::bubble_from_topic(&mut tx, &key).await?;
     tx.commit().await.map_err(|e| e.to_string())?;
+
+    crate::vcp_modules::sync_service::request_background_sync(&app_handle);
 
     Ok(topic)
 }

@@ -22,6 +22,7 @@ function makeSettings(): AppSettings {
     syncServerUrl: "ws://192.168.1.10:5975",
     syncHttpUrl: "http://192.168.1.10:5974",
     syncToken: "sync-token-1",
+    syncDeviceId: "mobile-test",
     adminUsername: "admin",
     adminPassword: "secret",
     fileKey: "file-key-1",

@@ -16,6 +16,7 @@ const baseSettings = (): AppSettings => ({
   syncServerUrl: "",
   syncHttpUrl: "",
   syncToken: "",
+  syncDeviceId: "",
   adminUsername: "",
   adminPassword: "",
   fileKey: "",

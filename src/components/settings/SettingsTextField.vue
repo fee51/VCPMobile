@@ -8,6 +8,7 @@ const props = defineProps<{
   type?: string;
   mono?: boolean;
   disabled?: boolean;
+  readonly?: boolean;
   error?: boolean;
   center?: boolean;
   isSecure?: boolean;
@@ -61,6 +62,7 @@ const toggleMask = () => {
     </label>
     <div class="relative group">
       <input :type="inputType" :value="modelValue ?? ''" :placeholder="placeholder" :disabled="disabled"
+        :readonly="readonly"
         autocomplete="off" autocapitalize="off" spellcheck="false"
         class="w-full bg-black/5 dark:bg-white/5 p-3.5 rounded-2xl outline-none border transition-all duration-200" :class="[
           mono || isSecure ? 'font-mono text-sm' : 'text-[14px]',

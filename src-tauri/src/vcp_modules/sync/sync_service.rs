@@ -38,7 +38,7 @@ const WS_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const SYNC_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(270);
 const PHASE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const FINAL_ACK_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_SYNC_RETRIES: u32 = 3;
+const MAX_SYNC_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_SYNC_TOPICS: usize = 10_000;
 #[cfg(target_os = "android")]
 const SYNC_GUARDIAN_LABEL: &str = "[数据同步] VCP Mobile";
@@ -215,14 +215,11 @@ async fn terminate_after_protocol_send_failure<R: Runtime>(
     let _ = close_ws_with_deadline(ws_stream).await;
 }
 
-fn take_retry_slot(retry_count: &mut u32, retry_delay: &mut Duration) -> Option<Duration> {
-    if *retry_count >= MAX_SYNC_RETRIES {
-        return None;
-    }
-    *retry_count += 1;
+fn next_retry_backoff(retry_count: &mut u32, retry_delay: &mut Duration) -> Duration {
+    *retry_count = retry_count.saturating_add(1);
     let backoff = *retry_delay;
-    *retry_delay = (*retry_delay * 2).min(Duration::from_secs(5));
-    Some(backoff)
+    *retry_delay = (*retry_delay * 2).min(MAX_SYNC_RETRY_BACKOFF);
+    backoff
 }
 
 #[derive(Debug)]
@@ -249,7 +246,7 @@ fn attempt_restart_failure(fallback_code: &str, message: &str) -> Option<Attempt
 async fn schedule_sync_retry<R: Runtime>(
     app_handle: &AppHandle<R>,
     session_id: u64,
-    status: &Arc<RwLock<String>>,
+    _status: &Arc<RwLock<String>>,
     cancel_token: &CancellationToken,
     retry_count: &mut u32,
     retry_delay: &mut Duration,
@@ -259,39 +256,22 @@ async fn schedule_sync_retry<R: Runtime>(
     if cancel_token.is_cancelled() {
         return false;
     }
-    let Some(backoff) = take_retry_slot(retry_count, retry_delay) else {
-        let final_message =
-            format!("{message}; retry budget exhausted after {MAX_SYNC_RETRIES} automatic retries");
-        emit_sync_log(app_handle, "error", &final_message);
-        publish_sync_error(
-            app_handle,
-            session_id,
-            status,
-            error_code,
-            &final_message,
-            Vec::new(),
-        )
-        .await;
-        return false;
-    };
+    let backoff = next_retry_backoff(retry_count, retry_delay);
     emit_sync_log(
         app_handle,
         "warning",
         &format!(
-            "{message}; reconnecting after {backoff:?} ({}/{MAX_SYNC_RETRIES})",
+            "{message}; reconnecting after {backoff:?} (attempt {})",
             *retry_count
         ),
     );
     let operator_message = if error_code == "SYNC_SNAPSHOT_STALE" {
         format!(
-            "检测到同步期间数据变化，正在重新比对（{}/{MAX_SYNC_RETRIES}）",
+            "检测到同步期间数据变化，正在重新比对（第 {} 次）",
             *retry_count
         )
     } else {
-        format!(
-            "连接中断，正在进行第 {}/{} 次自动重试",
-            *retry_count, MAX_SYNC_RETRIES
-        )
+        format!("连接中断，正在进行第 {} 次自动重试", *retry_count)
     };
     emit_operator_sync_log(app_handle, session_id, "warning", &operator_message);
     !cancelled_during(cancel_token, backoff).await
@@ -515,6 +495,7 @@ struct SyncSessionConfig {
     ws_url: String,
     http_url: String,
     sync_token: String,
+    sync_device_id: String,
     sync_prerender_enabled: bool,
     sync_log_level: String,
 }
@@ -1009,12 +990,14 @@ fn build_sync_session_config(
     ws_endpoint.set_query(None);
     ws_endpoint
         .query_pairs_mut()
-        .append_pair("token", &settings.sync_token);
+        .append_pair("token", &settings.sync_token)
+        .append_pair("deviceId", &settings.sync_device_id);
 
     Ok(SyncSessionConfig {
         ws_url: ws_endpoint.to_string(),
         http_url: http_endpoint.as_str().trim_end_matches('/').to_string(),
         sync_token: settings.sync_token.clone(),
+        sync_device_id: settings.sync_device_id.clone(),
         sync_prerender_enabled: settings.sync_prerender_enabled,
         sync_log_level: settings.sync_log_level.clone(),
     })
@@ -1051,11 +1034,18 @@ async fn run_sync_session(
         ws_url,
         http_url,
         sync_token,
+        sync_device_id,
         sync_prerender_enabled,
         sync_log_level: configured_log_level,
     } = session_config;
+    let device_id = sync_device_id.clone();
 
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    if let Ok(device_header) = reqwest::header::HeaderValue::from_str(&sync_device_id) {
+        default_headers.insert("x-device-id", device_header);
+    }
     let http_client = match reqwest::Client::builder()
+        .default_headers(default_headers)
         .connect_timeout(Duration::from_secs(10))
         .timeout(SYNC_HTTP_REQUEST_TIMEOUT)
         .build()
@@ -1546,7 +1536,8 @@ async fn run_sync_session(
                 // 1: 基础 Metadata (agent, group, avatar), 2: Topic Metadata
                 let manifest_phase = Arc::new(AtomicU8::new(1));
                 let mut fatal_error = false;
-                let mut sync_success = false;
+                let mut sync_cycle_active = false;
+                let mut sync_cycle_pending = false;
                 let mut restart_failure: Option<AttemptRestartFailure> = None;
                 let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(15));
 
@@ -2194,8 +2185,43 @@ async fn run_sync_session(
                                         ).await;
                                         break 'attempt;
                                     }
+                                    if sync_cycle_active {
+                                        sync_cycle_pending = true;
+                                    } else {
+                                        let _ = tx_internal.send(SyncCommand::StartManualSync);
+                                    }
                                 },
                                 SyncCommand::StartManualSync => {
+                                    if sync_cycle_active {
+                                        sync_cycle_pending = true;
+                                        continue;
+                                    }
+                                    sync_cycle_active = true;
+                                    {
+                                        let mut guard = connection_status_for_task.write().await;
+                                        if matches!(
+                                            guard.as_str(),
+                                            "completed" | "completed_with_warnings"
+                                        ) {
+                                            *guard = "open".to_string();
+                                        }
+                                    }
+                                    pending_msg_topics_task.completed.lock().await.clear();
+                                    pending_msg_topics_task.modified.lock().await.clear();
+                                    pending_msg_topics_task.failed.lock().await.clear();
+                                    pending_msg_topics_task.total.store(0, Ordering::SeqCst);
+                                    pending_msg_topics_task
+                                        .legacy_attachment_warnings
+                                        .store(0, Ordering::SeqCst);
+                                    changed_topics.lock().await.clear();
+                                    changed_owners.lock().await.clear();
+                                    pending_diff_batches.lock().await.clear();
+                                    expected_phase3_batch.lock().await.clear();
+                                    *expected_topic_hash_results.lock().await = None;
+                                    phase3_batch_inflight.store(false, Ordering::SeqCst);
+                                    if let Ok(mut pending) = awaiting_final_ack.lock() {
+                                        *pending = None;
+                                    }
                                     let db = handle_clone.state::<DbState>();
                                     manifest_phase.store(1, Ordering::SeqCst);
                                     match Phase1Metadata::build_owner_manifest(&db.pool).await {
@@ -2207,6 +2233,7 @@ async fn run_sync_session(
                                                     *expected = HashSet::from([ManifestType::Owner]);
                                                 }
                                                 Err(_) => {
+                                                    sync_cycle_active = false;
                                                     let _ = tx_internal.send(SyncCommand::FailAttemptDetailed {
                                                         attempt_id,
                                                         code: "SYNC_STATE_POISONED".to_string(),
@@ -2239,6 +2266,7 @@ async fn run_sync_session(
                                                 .await;
                                         }
                                         Err(error) => {
+                                            sync_cycle_active = false;
                                             let _ = tx_internal.send(SyncCommand::FailAttemptDetailed {
                                                 attempt_id,
                                                 code: "OWNER_MANIFEST_DB_FAILED".to_string(),
@@ -2648,21 +2676,27 @@ async fn run_sync_session(
                                             break;
                                         }
 
-                                        sync_success = publish_sync_completed(
+                                        let completed = publish_sync_completed(
                                             &handle_clone,
                                             session_id,
                                             &connection_status_for_task,
                                             pending_msg_topics_task.completion_summary().await,
                                         ).await;
-                                        if sync_success {
-                                            if let Ok(mut logger) = sync_logger_task.lock() {
-                                                (*logger).end_session();
-                                            }
-                                            emit_sync_log(&handle_clone, "success", "同步已完成，所有数据已对齐");
-
+                                        if completed {
+                                            emit_sync_log(
+                                                &handle_clone,
+                                                "success",
+                                                "同步已完成，保持连接以接收其他设备更新",
+                                            );
                                         }
-                                        let _ = close_ws_with_deadline(&mut ws_stream).await;
-                                        break;
+                                        retry_count = 0;
+                                        retry_delay = Duration::from_millis(500);
+                                        sync_cycle_active = false;
+                                        if sync_cycle_pending {
+                                            sync_cycle_pending = false;
+                                            let _ = tx_internal.send(SyncCommand::StartManualSync);
+                                        }
+                                        continue;
                                     },
                                     "SYNC_LOG_EVENT" => {
                                         let event = match serde_json::from_str::<SyncLogEventFrame>(&text) {
@@ -2677,6 +2711,29 @@ async fn run_sync_session(
                                             }
                                         };
                                         emit_sync_log(&handle_clone, &event.level, &format!("[Desktop] {}", event.message));
+                                    },
+                                    "REMOTE_CHANGE_AVAILABLE" => {
+                                        let source_device_id = serde_json::from_str::<serde_json::Value>(&text)
+                                            .ok()
+                                            .and_then(|value| {
+                                                value.get("sourceDeviceId")
+                                                    .or_else(|| value.get("source_device_id"))
+                                                    .cloned()
+                                            })
+                                            .and_then(|value| value.as_str().map(str::to_string))
+                                            .unwrap_or_default();
+                                        if source_device_id != device_id {
+                                            emit_sync_log(
+                                                &handle_clone,
+                                                "info",
+                                                "检测到其他设备更新，开始自动同步",
+                                            );
+                                            if sync_cycle_active {
+                                                sync_cycle_pending = true;
+                                            } else {
+                                                let _ = tx_internal.send(SyncCommand::StartManualSync);
+                                            }
+                                        }
                                     },
                                     "DESKTOP_PHASE_START" | "DESKTOP_PHASE_COMPLETE" => {
                                         let event = match serde_json::from_str::<DesktopPhaseEventFrame>(&text) {
@@ -2755,7 +2812,7 @@ async fn run_sync_session(
                 }
                 attempt_cancel.cancel();
                 task_tracker.close_and_wait().await;
-                if !sync_success {
+                {
                     if let Err(error) = write_queue_task.flush().await {
                         let message =
                             format!("Failed to drain database writes before reconnect: {error}");
@@ -2801,32 +2858,28 @@ async fn run_sync_session(
                         &handle_clone,
                     );
                 }
-                if sync_success {
-                    break; // 同步完成，退出外层 loop
-                } else {
-                    if fatal_error {
-                        break;
-                    }
-                    let retry = restart_failure.unwrap_or_else(|| AttemptRestartFailure {
-                        code: "WS_DISCONNECTED".to_string(),
-                        message: "同步中途异常断开".to_string(),
-                    });
-                    if schedule_sync_retry(
-                        &handle_clone,
-                        session_id,
-                        &connection_status_for_task,
-                        &cancel_token,
-                        &mut retry_count,
-                        &mut retry_delay,
-                        &retry.code,
-                        &retry.message,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
+                if fatal_error {
                     break;
                 }
+                let retry = restart_failure.unwrap_or_else(|| AttemptRestartFailure {
+                    code: "WS_DISCONNECTED".to_string(),
+                    message: "同步中途异常断开".to_string(),
+                });
+                if schedule_sync_retry(
+                    &handle_clone,
+                    session_id,
+                    &connection_status_for_task,
+                    &cancel_token,
+                    &mut retry_count,
+                    &mut retry_delay,
+                    &retry.code,
+                    &retry.message,
+                )
+                .await
+                {
+                    continue;
+                }
+                break;
             }
             Err(_) => {
                 let retry_message = format!(
@@ -3183,12 +3236,39 @@ pub async fn get_sync_status(state: State<'_, SyncState>) -> Result<String, Stri
     Ok(state.connection_status.read().await.clone())
 }
 
+pub fn request_background_sync<R: Runtime>(app_handle: &AppHandle<R>) {
+    if let Some(sync_state) = app_handle.try_state::<SyncState>() {
+        let _ = sync_state.ws_sender.send(SyncCommand::StartManualSync);
+    }
+}
+
+pub async fn start_sync_internal(handle: AppHandle) -> Result<u64, String> {
+    let state = handle.state::<SyncState>();
+    start_manual_sync(handle.clone(), state).await
+}
+
 #[tauri::command]
 pub async fn start_manual_sync(
     handle: AppHandle,
     state: State<'_, SyncState>,
 ) -> Result<u64, String> {
     let _lifecycle_guard = state.lifecycle.lock().await;
+
+    {
+        let session = state.session.lock().await;
+        if let Some(active) = session.as_ref() {
+            if !active.join_handle.is_finished() {
+                let session_id = active.session_id;
+                active
+                    .command_tx
+                    .send(SyncCommand::StartManualSync)
+                    .map_err(|error| {
+                        encode_sync_command_error("SYNC_START_CHANNEL_FAILED", &error.to_string())
+                    })?;
+                return Ok(session_id);
+            }
+        }
+    }
 
     let finished_session = {
         let mut session = state.session.lock().await;
@@ -3532,6 +3612,7 @@ mod tests {
             sync_server_url: "wss://192.168.1.10:5975/ws-sync".to_string(),
             sync_http_url: "https://192.168.1.10:5974".to_string(),
             sync_token: "sync-token".to_string(),
+            sync_device_id: "mobile-test".to_string(),
             sync_log_level: "DEBUG".to_string(),
             sync_prerender_enabled: true,
             ..Settings::default()
@@ -3560,11 +3641,14 @@ mod tests {
 
         let ws_url = url::Url::parse(&config.ws_url).expect("validated WebSocket URL");
         let query = ws_url.query_pairs().collect::<Vec<_>>();
-        assert_eq!(query.len(), 1);
+        assert_eq!(query.len(), 2);
         assert_eq!(query[0].0, "token");
         assert_eq!(query[0].1, "token +/?");
+        assert_eq!(query[1].0, "deviceId");
+        assert_eq!(query[1].1, "mobile-test");
         assert_eq!(config.http_url, "https://192.168.1.10:5974/base");
         assert_eq!(config.sync_token, "token +/?");
+        assert_eq!(config.sync_device_id, "mobile-test");
         assert_eq!(config.sync_log_level, "DEBUG");
         assert!(config.sync_prerender_enabled);
     }
