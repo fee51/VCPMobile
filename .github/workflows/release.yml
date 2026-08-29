@@ -158,9 +158,24 @@ jobs:
             fi
           done
 
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "${ANDROID_KEYSTORE_PATH}"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '\r\n' | base64 --decode > "${ANDROID_KEYSTORE_PATH}"
           test -s "${ANDROID_KEYSTORE_PATH}"
-          keytool -list -keystore "$ANDROID_KEYSTORE_PATH" -alias "$ANDROID_KEY_ALIAS" -storepass:env ANDROID_KEYSTORE_PASSWORD >/dev/null
+
+          RESOLVED_KEY_ALIAS="$ANDROID_KEY_ALIAS"
+          if ! keytool -list -keystore "$ANDROID_KEYSTORE_PATH" -alias "$RESOLVED_KEY_ALIAS" -storepass "$ANDROID_KEYSTORE_PASSWORD" >/dev/null; then
+            echo "Configured ANDROID_KEY_ALIAS was not usable; resolving alias from keystore"
+            RESOLVED_KEY_ALIAS=$(keytool -list -v \
+              -keystore "$ANDROID_KEYSTORE_PATH" \
+              -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+              | sed -n 's/^Alias name: //p' \
+              | head -n 1)
+            if [[ -z "${RESOLVED_KEY_ALIAS}" ]]; then
+              echo "Failed to open Android keystore or find a key alias" >&2
+              exit 1
+            fi
+          fi
+          echo "::add-mask::${RESOLVED_KEY_ALIAS}"
+          echo "ANDROID_KEY_ALIAS=${RESOLVED_KEY_ALIAS}" >> "$GITHUB_ENV"
 
       - name: Build Android APKs
         shell: bash
@@ -168,7 +183,7 @@ jobs:
           NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.NDK_VERSION }}
           ANDROID_KEYSTORE_PATH: ${{ env.ANDROID_KEYSTORE_PATH }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_ALIAS: ${{ env.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           VCP_TRUSTED_LAN_MODE: enabled
         run: |
