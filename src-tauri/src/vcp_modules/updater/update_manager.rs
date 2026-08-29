@@ -14,11 +14,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 pub const UPDATE_STATUS_EVENT: &str = "vcp-update://status";
 
-const GITHUB_API_LATEST_URL: &str = "https://api.github.com/repos/MRiecy/VCPMobile/releases/latest";
+const GITHUB_API_LATEST_URL: &str = "https://api.github.com/repos/fee51/VCPMobile/releases/latest";
 /// 回退列表需要拉取多条：列表按创建时间倒序，最新创建的可能不是应用版本
 /// Release（例如同步模块的独立发布），必须过滤后才能取到真正的应用版本。
 const GITHUB_API_LIST_URL: &str =
-    "https://api.github.com/repos/MRiecy/VCPMobile/releases?per_page=10";
+    "https://api.github.com/repos/fee51/VCPMobile/releases?per_page=10";
 const APK_ASSET_SUFFIX: &str = "arm64-v8a.apk";
 const CHECKSUM_ASSET_SUFFIX: &str = "arm64-v8a.apk.sha256";
 const UPDATES_DIR_NAME: &str = "updates";
@@ -27,7 +27,7 @@ const APK_PART_FILENAME: &str = "update.apk.part";
 const INSTALLING_APK_PREFIX: &str = "installing-";
 const STALE_INSTALLER_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_APK_BYTES: u64 = 512 * 1024 * 1024;
-const GITHUB_RELEASE_PATH_PREFIX: &str = "/MRiecy/VCPMobile/releases/download/";
+const GITHUB_RELEASE_PATH_PREFIX: &str = "/fee51/VCPMobile/releases/download/";
 const LEGACY_FRONTEND_UPDATES_DIR: &str = "frontend_updates";
 const LEGACY_FRONTEND_DOWNLOADS_DIR: &str = "frontend_update_downloads";
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
@@ -1145,7 +1145,7 @@ mod tests {
         GitHubAsset {
             name: name.to_string(),
             browser_download_url: format!(
-                "https://github.com/MRiecy/VCPMobile/releases/download/v1.1.4/{name}"
+                "https://github.com/fee51/VCPMobile/releases/download/v1.1.4/{name}"
             ),
             size: 100,
         }
@@ -1155,7 +1155,7 @@ mod tests {
         GitHubRelease {
             tag_name: tag.to_string(),
             body: None,
-            html_url: format!("https://github.com/MRiecy/VCPMobile/releases/tag/{tag}"),
+            html_url: format!("https://github.com/fee51/VCPMobile/releases/tag/{tag}"),
             assets: vec![],
         }
     }
@@ -1292,28 +1292,28 @@ mod tests {
     #[test]
     fn release_asset_url_validation() {
         assert!(validate_release_asset_url(
-            "https://github.com/MRiecy/VCPMobile/releases/download/v1.2.3/VCPMobile_v1.2.3_arm64-v8a.apk",
+            "https://github.com/fee51/VCPMobile/releases/download/v1.2.3/VCPMobile_v1.2.3_arm64-v8a.apk",
             "arm64-v8a.apk"
         )
         .is_ok());
         assert!(validate_release_asset_url(
-            "https://github.com/MRiecy/VCPMobile/releases/download/v1.2.3/VCPMobile_v1.2.3_arm64-v8a.apk.sha256",
+            "https://github.com/fee51/VCPMobile/releases/download/v1.2.3/VCPMobile_v1.2.3_arm64-v8a.apk.sha256",
             "arm64-v8a.apk.sha256"
         )
         .is_ok());
         // 后缀不匹配：sha256 旁车不能当 APK 用
         assert!(validate_release_asset_url(
-            "https://github.com/MRiecy/VCPMobile/releases/download/v1.2.3/VCPMobile_v1.2.3_arm64-v8a.apk.sha256",
+            "https://github.com/fee51/VCPMobile/releases/download/v1.2.3/VCPMobile_v1.2.3_arm64-v8a.apk.sha256",
             "arm64-v8a.apk"
         )
         .is_err());
         assert!(validate_release_asset_url(
-            "http://github.com/MRiecy/VCPMobile/releases/download/v1/x.apk",
+            "http://github.com/fee51/VCPMobile/releases/download/v1/x.apk",
             "arm64-v8a.apk"
         )
         .is_err());
         assert!(validate_release_asset_url(
-            "https://example.com/MRiecy/VCPMobile/releases/download/v1/x.apk",
+            "https://example.com/fee51/VCPMobile/releases/download/v1/x.apk",
             "arm64-v8a.apk"
         )
         .is_err());

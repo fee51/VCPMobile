@@ -19,7 +19,7 @@ const available: UpdateStatus = {
     hasUpdate: true,
     currentVersion: '1.1.4',
     latestVersion: '1.2.0',
-    releasePageUrl: 'https://github.com/MRiecy/VCPMobile/releases/tag/v1.2.0',
+    releasePageUrl: 'https://github.com/fee51/VCPMobile/releases/tag/v1.2.0',
     releaseNotes: 'notes',
     apkSize: 100 * 1024 * 1024,
     apkSha256: 'a'.repeat(64),

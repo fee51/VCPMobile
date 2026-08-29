@@ -1,14 +1,14 @@
 ---
 title: APK 更新体系
 id: module-08
-version: "1.1.4"
+version: "1.1.6"
 description: Rust 状态机驱动的 GitHub Release 检查、断点续传下载、SHA-256 与签名校验、Android 系统安装
 tags: [ota, update, apk, semver, sha256, state-machine]
 related_modules:
   - module-09
   - module-10
 created_at: "2026-05-13"
-updated_at: "2026-08-17"
+updated_at: "2026-08-29"
 ---
 
 # 08. APK 更新体系
@@ -73,7 +73,7 @@ Idle → Checking → Available → Downloading → Verifying → ReadyToInstall
 
 ## 4. Release 查询与资产选择
 
-固定查询仓库 `MRiecy/VCPMobile`：
+固定查询仓库 `fee51/VCPMobile`：
 
 1. 优先请求 `/releases/latest`；404 时降级 `/releases?per_page=1`；
 2. semver 比较远端 tag 与当前 APK 版本；

@@ -161,11 +161,11 @@ const showFeatures = () => {
 };
 
 const openGitHub = () => {
-  openUrl('https://github.com/MRiecy/VCPMobile');
+  openUrl('https://github.com/fee51/VCPMobile');
 };
 
 const openFeedback = () => {
-  openUrl('https://github.com/MRiecy/VCPMobile/issues');
+  openUrl('https://github.com/fee51/VCPMobile/issues');
 };
 </script>
 

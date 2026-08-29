@@ -2966,6 +2966,10 @@ async fn run_sync_session(
     // 失败 attempt 也可能已有部分实体写入；离开 session 前必须丢弃旧 Facade cache。
     crate::vcp_modules::sync::sync_finalize::invalidate_sync_entity_caches(&app_handle);
 
+    if let Ok(mut logger) = sync_logger.lock() {
+        logger.end_session();
+    }
+
     let sync_state = app_handle.state::<SyncState>();
     let _owner_commit = sync_state.owner_commit.lock().await;
     if sync_state.current_session_id.load(Ordering::SeqCst) == session_id {

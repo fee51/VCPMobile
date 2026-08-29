@@ -19,6 +19,14 @@ describe('OTA update governance contracts', () => {
     expect(updateManagerSource).toContain('verify_file_sha256');
   });
 
+  it('checks this fork\'s GitHub releases instead of upstream', () => {
+    expect(updateManagerSource).toContain(
+      'https://api.github.com/repos/fee51/VCPMobile/releases/latest',
+    );
+    expect(updateManagerSource).toContain('/fee51/VCPMobile/releases/download/');
+    expect(updateManagerSource).not.toContain('repos/MRiecy/VCPMobile/releases');
+  });
+
   it('keeps the Rust state machine as the single owner of update state', () => {
     // 五个命令全部注册
     for (const command of [
