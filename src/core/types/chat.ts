@@ -229,6 +229,7 @@ export type AstMutation =
   | { op: "remove"; id: string };
 
 export interface TailFrame {
+  streamId: number;
   epoch: number;
   revision: number;
   frameSeq: number;
@@ -244,6 +245,8 @@ export interface TailFrame {
 interface StreamBlockFields {
   content?: string;
   nodes?: MarkdownNode[];
+  /** Aurora tail 的前端运行时渲染模式；稳定块与持久化数据不携带。 */
+  render_mode?: TailRenderMode;
   theme?: string;
   is_complete?: boolean;
   tool_name?: string;
@@ -313,19 +316,50 @@ export type StreamBlock =
       raw_content: string;
     });
 
+export type TailRenderMode = "ast" | "plain";
+
+export interface StableAppend {
+  baseCount: number;
+  blocks: StreamBlock[];
+}
+
+export type TailTextOp =
+  | {
+      op: "append";
+      baseHash?: string;
+      content: string;
+      hash: string;
+      mode: TailRenderMode;
+    }
+  | {
+      op: "replace";
+      content: string;
+      hash: string;
+      mode: TailRenderMode;
+    }
+  | { op: "clear" };
+
 /**
  * Aurora 语义沉淀更新，由 Rust 流式管道推送
  */
 export interface AuroraUpdate {
+  kind: "delta" | "snapshot";
+  streamId?: number;
   stableBlocks?: StreamBlock[];
-  stableChanged?: boolean;
+  stableAppend?: StableAppend;
   tailBlock?: StreamBlock;
-  tail?: string;
-  tailChanged?: boolean;
+  tailMode?: TailRenderMode;
+  tailOp?: TailTextOp;
   tailFrame?: TailFrame;
-  tailSnapshot?: MarkdownNode[];
   content?: string;
   chunk?: string;
+}
+
+export interface AuroraRecoverySnapshot {
+  stableBlocks: StreamBlock[];
+  tailBlock?: StreamBlock;
+  tailMode?: TailRenderMode;
+  tailSnapshot: MarkdownNode[];
 }
 
 export interface StreamContextDto {
@@ -347,9 +381,21 @@ export interface StreamEventDto {
   context: StreamContextDto | null;
   finishReason: string | null;
   error: string | null;
+  content?: string | null;
   aurora: AuroraUpdate | null;
   blocks: ContentBlock[] | null;
   timestamp: number | null;
+  topicUpdatedAt: number | null;
+}
+
+export interface MessageWriteResultDto {
+  blocks: ContentBlock[];
+  topicUpdatedAt: number;
+}
+
+export interface TopicActivityDto {
+  msgCount: number;
+  updatedAt: number;
 }
 
 export interface ActiveGenerationDto {

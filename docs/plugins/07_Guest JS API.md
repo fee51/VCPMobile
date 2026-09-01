@@ -92,14 +92,21 @@ export interface PickedFile {
   thumbnailPath?: string;
 }
 
-export function pickFile(): Promise<PickedFile> {
-  return invoke<PickedFile>('plugin:vcp-mobile|pick_file');
+export type PickFileMode = 'file' | 'camera' | 'gallery' | 'avatar';
+
+export function pickFile(mode?: PickFileMode): Promise<PickedFile> {
+  return invoke<PickedFile>('plugin:vcp-mobile|pick_file', mode ? { mode } : undefined);
+}
+
+export function deleteTempFile(filePath: string): Promise<void> {
+  return invoke('plugin:vcp-mobile|delete_temp_file', { filePath });
 }
 ```
 
 | 函数 | Tauri 命令 | 参数 | 返回值 | 对应 Rust 函数 |
 |------|-----------|------|--------|---------------|
-| `pickFile()` | `plugin:vcp-mobile\|pick_file` | 无 | `Promise<PickedFile>` | `system::pick_file` |
+| `pickFile(mode?)` | `plugin:vcp-mobile\|pick_file` | `{ mode? }` | `Promise<PickedFile>` | `system::pick_file` |
+| `deleteTempFile(path)` | `plugin:vcp-mobile\|delete_temp_file` | `{ filePath }` | `Promise<void>` | `system::delete_temp_file` |
 
 #### 返回值说明
 
@@ -110,7 +117,11 @@ export function pickFile(): Promise<PickedFile> {
 - **`hash`**：文件内容的 SHA-256 哈希值，用于去重与完整性校验。
 - **`thumbnailPath`**（可选）：当选择图片/视频时，系统生成的缩略图路径。
 
+`mode: "avatar"` 不发送附件 staging 事件：Native 将原图采样为最长边 1120px、EXIF 归一化的 WebP，删除原图 staging 后只返回受控工作副本；返回的 `size` 与 `hash` 均对应该 WebP。调用方在取消、确认或卸载时用 `deleteTempFile()` 释放。
+
 > **平台限制**：该接口仅在 Android 物理端可用；桌面端调用将抛出错误。
+
+开发环境中 `tauri-plugin-vcp-mobile` 是本地 file dependency，`vite.config.ts` 将它排除在 `optimizeDeps` 预打包之外。否则 Guest JS 新增导出后，旧的 `node_modules/.vite` 快照可能仍被异步页面加载，表现为“源码已有导出但页面首次进入报 missing export”。
 
 ---
 
@@ -182,6 +193,17 @@ if (!status.notification) {
 }
 ```
 
+### 5.4 原生文件打开与分享
+
+```typescript
+import { openFileNative, shareFileNative } from 'tauri-plugin-vcp-mobile';
+
+await openFileNative(localCachePath);  // ACTION_VIEW
+await shareFileNative(localCachePath); // ACTION_SEND + 系统分享面板
+```
+
+两个封装复用已注册的 `open_file_native` 命令，通过 `action: 'view' | 'share'` 区分行为。分享模式发送文件的 `content://` URI，不把文件正文塞进分享文本；调用方必须先将导出物放入应用沙箱内可由 `FileProvider` 授权的位置。
+
 ---
 
 ## 6. 未封装命令清单
@@ -194,7 +216,6 @@ if (!status.notification) {
 | `plugin:vcp-mobile\|request_android_permission` | `{ p_type: string }` | `void` | 请求指定权限（`notification` / `storage` / `microphone` 等） |
 | `plugin:vcp-mobile\|move_task_to_back` | 无 | `void` | 将应用移至后台 |
 | `plugin:vcp-mobile\|get_battery_status` | 无 | `{ level: number, isPowerSaveMode: boolean }` | 获取电池电量与省电模式状态 |
-| `plugin:vcp-mobile\|open_file_native` | `{ path: string }` | `void` | 调用系统原生应用打开指定路径文件 |
 
 > **建议**：后续应在 `guest-js/index.ts` 中补充这些函数的 TS 封装，以保持一致性。参数名 `p_type` 也应在前端枚举化，避免字符串硬编码。
 

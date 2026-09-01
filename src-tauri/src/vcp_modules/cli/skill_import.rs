@@ -786,7 +786,7 @@ fn copy_verified_candidate(
     set_mode(destination, 0o600)?;
     let mut digest = Sha256::new();
     let mut total = 0u64;
-    let mut buffer = [0u8; COPY_BUFFER_BYTES];
+    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
     loop {
         let read = source.read(&mut buffer).map_err(|error| {
             SkillError::integrity(format!("cannot read picked Skill file: {error}"))
@@ -809,7 +809,9 @@ fn copy_verified_candidate(
                 SkillError::integrity(format!("cannot copy picked Skill file: {error}"))
             })?;
     }
-    if total != picked.size || format!("{:x}", digest.finalize()) != picked.hash {
+    if total != picked.size
+        || crate::vcp_modules::infra::utils::finalize_sha256_hex(digest) != picked.hash
+    {
         return Err(SkillError::integrity(
             "picked Skill size or SHA-256 does not match the native picker receipt",
         ));
@@ -828,7 +830,7 @@ fn verify_regular_file_hash(
     let mut file = open_regular_nofollow(path, max_bytes)?;
     let mut digest = Sha256::new();
     let mut total = 0u64;
-    let mut buffer = [0u8; COPY_BUFFER_BYTES];
+    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
     loop {
         let read = file.read(&mut buffer).map_err(|error| {
             SkillError::integrity(format!("cannot read owned Skill candidate: {error}"))
@@ -839,7 +841,9 @@ fn verify_regular_file_hash(
         total += read as u64;
         digest.update(&buffer[..read]);
     }
-    if total != expected_bytes || format!("{:x}", digest.finalize()) != expected_sha256 {
+    if total != expected_bytes
+        || crate::vcp_modules::infra::utils::finalize_sha256_hex(digest) != expected_sha256
+    {
         return Err(SkillError::integrity(
             "owned Skill candidate integrity failed",
         ));
@@ -1128,7 +1132,7 @@ fn commit_request_sha256(request: &CommitSkillImportRequest) -> String {
         digest.update((value.len() as u64).to_le_bytes());
         digest.update(value);
     }
-    format!("{:x}", digest.finalize())
+    crate::vcp_modules::infra::utils::finalize_sha256_hex(digest)
 }
 
 fn import_count(imports_root: &Path) -> Result<usize, SkillError> {

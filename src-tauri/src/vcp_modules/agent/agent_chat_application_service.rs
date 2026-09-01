@@ -2,10 +2,12 @@ use crate::vcp_modules::agent_service::{read_agent_config_internal, AgentConfigS
 use crate::vcp_modules::chat_manager::ChatMessage;
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::message_service;
+use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
 use crate::vcp_modules::topic_types::{MessageKey, TopicKey};
 use crate::vcp_modules::vcp_client::{
-    message_transport_request_id, perform_vcp_request, perform_vcp_request_registered,
-    ActiveRequestLease, ActiveRequests, StreamEvent, VcpRequestPayload,
+    freeze_chat_connection, message_transport_request_id, perform_vcp_request,
+    perform_vcp_request_registered, ActiveRequestLease, ActiveRequests, ChatConnectionSnapshot,
+    ChatRequestPurpose, StreamEvent, VcpRequestPayload,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,8 +19,6 @@ pub struct AgentChatPayload {
     pub agent_id: String,
     pub topic_id: String,
     pub user_message: ChatMessage,
-    pub vcp_url: String,
-    pub vcp_api_key: String,
 }
 
 #[tauri::command]
@@ -27,27 +27,33 @@ pub async fn handle_agent_chat_message(
     agent_state: State<'_, AgentConfigState>,
     db_state: State<'_, DbState>,
     active_requests: State<'_, ActiveRequests>,
+    settings_state: State<'_, SettingsState>,
     payload: AgentChatPayload,
     stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
 ) -> Result<Value, String> {
+    let settings = read_settings(app_handle.clone(), settings_state).await?;
+    let connection = freeze_chat_connection(&settings, ChatRequestPurpose::Interactive)?;
     internal_process_agent_chat_message(
         app_handle,
         agent_state,
         db_state,
         active_requests,
         payload,
+        connection,
         stream_channel,
         false, // append_user_msg
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn internal_process_agent_chat_message(
     app_handle: AppHandle,
     agent_state: State<'_, AgentConfigState>,
     db_state: State<'_, DbState>,
     active_requests: State<'_, ActiveRequests>,
     payload: AgentChatPayload,
+    connection: ChatConnectionSnapshot,
     stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
     append_user_msg: bool,
 ) -> Result<Value, String> {
@@ -145,8 +151,8 @@ pub async fn internal_process_agent_chat_message(
     let _ = stream_channel.send(StreamEvent::thinking(thinking_id.clone(), context.clone()));
 
     let request_payload = VcpRequestPayload {
-        vcp_url: payload.vcp_url,
-        vcp_api_key: payload.vcp_api_key,
+        vcp_url: connection.endpoint_url,
+        vcp_api_key: connection.api_key,
         messages,
         model_config,
         message_id: thinking_id.clone(),
@@ -196,18 +202,19 @@ pub async fn internal_process_agent_chat_message(
                 .await?;
             }
         }
-        Err(e) => {
-            log::error!("[AgentChatAppService] perform_vcp_request failed: {}", e);
-            // 与 assistant 路径对齐：失败必须向前端补发 error 终结事件，
-            // 否则 thinking 气泡永远悬挂，用户看到的是"Agent 完全无反应"
-            let _ =
-                stream_channel.send(StreamEvent::error(thinking_id.clone(), context, e.clone()));
-            crate::vcp_modules::vcp_client::finalize_stream_error(
+        Err(failure) => {
+            log::error!(
+                "[AgentChatAppService] perform_vcp_request failed: {}",
+                failure
+            );
+            let (error, partial_content) = failure.into_parts();
+            let _ = crate::vcp_modules::vcp_client::finalize_stream_error(
                 &app_handle,
                 &db_state.pool,
                 &request_key,
-                None,
-                Some(e),
+                partial_content.unwrap_or_default(),
+                error,
+                Some(stream_channel),
             )
             .await?;
         }
@@ -222,8 +229,6 @@ pub async fn internal_process_agent_chat_message(
 pub struct AssistantChatPayload {
     pub agent_id: String,
     pub temp_messages: Vec<crate::vcp_modules::chat::topic_service::TempMessage>,
-    pub vcp_url: String,
-    pub vcp_api_key: String,
 }
 
 #[tauri::command]
@@ -232,9 +237,12 @@ pub async fn handle_assistant_chat_stream(
     app_handle: AppHandle,
     agent_state: State<'_, AgentConfigState>,
     active_requests: State<'_, ActiveRequests>,
+    settings_state: State<'_, SettingsState>,
     payload: AssistantChatPayload,
     stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
 ) -> Result<Value, String> {
+    let settings = read_settings(app_handle.clone(), settings_state).await?;
+    let connection = freeze_chat_connection(&settings, ChatRequestPurpose::Interactive)?;
     let agent_id = payload.agent_id;
     let temp_messages = payload.temp_messages;
 
@@ -299,8 +307,8 @@ pub async fn handle_assistant_chat_stream(
         thinking_id.clone(),
     );
     let request_payload = VcpRequestPayload {
-        vcp_url: payload.vcp_url,
-        vcp_api_key: payload.vcp_api_key,
+        vcp_url: connection.endpoint_url,
+        vcp_api_key: connection.api_key,
         messages,
         model_config,
         message_id: thinking_id.clone(),
@@ -347,18 +355,32 @@ pub async fn handle_assistant_chat_stream(
                     thinking_id.clone(),
                     context,
                     finish_reason,
+                    res["fullContent"].as_str().map(str::to_string),
                     None,
                     Some(final_ts),
+                    None,
                 ));
             }
         }
-        Err(e) => {
+        Err(failure) => {
             log::error!(
                 "[AssistantChatAppService] perform_vcp_request failed: {}",
-                e
+                failure
             );
-            let _ =
-                stream_channel.send(StreamEvent::error(thinking_id.clone(), context, e.clone()));
+            let (error, partial_content) = failure.into_parts();
+            let final_content = crate::vcp_modules::vcp_client::stream_error_content(
+                partial_content.as_deref().unwrap_or_default(),
+                &error,
+            );
+            let _ = stream_channel.send(StreamEvent::end(
+                thinking_id.clone(),
+                context,
+                Some("error".to_string()),
+                Some(final_content),
+                None,
+                Some(final_ts),
+                None,
+            ));
         }
     }
 

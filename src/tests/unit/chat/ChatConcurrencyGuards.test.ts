@@ -54,6 +54,36 @@ describe("chat conversation concurrency guards", () => {
     expect(session.isConversationCurrent(firstA)).toBe(false);
   });
 
+  it("refreshes owner presentation without changing conversation identity", () => {
+    const session = useChatSessionStore();
+    session.setConversation(
+      {
+        id: "agent-a",
+        name: "Old name",
+        type: "agent",
+        avatarCalculatedColor: "#111111",
+      },
+      "topic-a",
+    );
+    const originalKey = session.currentConversationKey;
+
+    session.setConversation(
+      {
+        id: "agent-a",
+        name: "New name",
+        type: "agent",
+        avatarCalculatedColor: "#222222",
+      },
+      "topic-a",
+    );
+
+    expect(session.currentConversationKey).toBe(originalKey);
+    expect(session.currentSelectedItem).toMatchObject({
+      name: "New name",
+      avatarCalculatedColor: "#222222",
+    });
+  });
+
   it("does not let a slow owner selection overwrite a newer selection", async () => {
     const session = useChatSessionStore();
     const assistant = useAssistantStore();
@@ -138,13 +168,13 @@ describe("chat conversation concurrency guards", () => {
     session.setConversation({ id: "agent-a", type: "agent" }, "topic-a");
     await history.loadHistoryPaginated("agent-a", "agent", "topic-a");
 
-    const append = deferred<any[]>();
+    const append = deferred<{ blocks: any[]; topicUpdatedAt: number }>();
     mockInvoke("append_single_message", () => append.promise);
     const pendingSend = history.sendMessage("hello");
 
     session.setConversation({ id: "agent-b", type: "agent" }, "topic-b");
     history.resetHistoryForConversation();
-    append.resolve([]);
+    append.resolve({ blocks: [], topicUpdatedAt: 100 });
     await pendingSend;
 
     const appendCall = invokeMock.mock.calls.find(
@@ -255,6 +285,7 @@ describe("chat conversation concurrency guards", () => {
       aurora: null,
       blocks: null,
       timestamp: null,
+      topicUpdatedAt: null,
     });
 
     expect(
@@ -264,7 +295,7 @@ describe("chat conversation concurrency guards", () => {
     ).toBe(false);
   });
 
-  it("stops the original message even when the visible conversation changes", async () => {
+  it("submits stop to the original message and waits for its durable end", async () => {
     const session = useChatSessionStore();
     const stream = useChatStreamStore();
     session.setConversation({ id: "agent-a", type: "agent" }, "topic-a");
@@ -283,6 +314,7 @@ describe("chat conversation concurrency guards", () => {
       aurora: null,
       blocks: null,
       timestamp: null,
+      topicUpdatedAt: null,
     });
 
     const interrupt = deferred<unknown>();
@@ -310,13 +342,14 @@ describe("chat conversation concurrency guards", () => {
       aurora: null,
       blocks: null,
       timestamp: null,
+      topicUpdatedAt: null,
     });
     interrupt.resolve(undefined);
     await stoppingA;
 
     expect(
       stream.isMessageActive("agent-a", "agent", "topic-a", "assistant-a"),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       stream.isMessageActiveInSession(
         "agent-b",
@@ -325,6 +358,28 @@ describe("chat conversation concurrency guards", () => {
         "assistant-b",
       ),
     ).toBe(true);
+
+    await stream.processStreamEvent({
+      type: "end",
+      chunk: null,
+      messageId: "assistant-a",
+      context: {
+        ownerId: "agent-a",
+        ownerType: "agent",
+        topicId: "topic-a",
+        agentId: "agent-a",
+      },
+      finishReason: "cancelled_by_user",
+      error: null,
+      content: "partial\n\n> VCP流式错误: 请求已中止",
+      aurora: null,
+      blocks: [],
+      timestamp: 123,
+      topicUpdatedAt: 124,
+    });
+    expect(
+      stream.isMessageActive("agent-a", "agent", "topic-a", "assistant-a"),
+    ).toBe(false);
   });
 
   it("claims a cold recovery once and never starts the removed two-step resume path", async () => {

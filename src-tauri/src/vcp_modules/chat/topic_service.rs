@@ -8,9 +8,78 @@ use crate::vcp_modules::sync_service::{SyncCommand, SyncState};
 use crate::vcp_modules::sync_types::DeleteTarget;
 use crate::vcp_modules::topic_types::{MessageKey, Topic, TopicKey};
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{sqlite::SqliteRow, Row};
 use std::collections::HashMap;
 use tauri::{ipc::Channel, AppHandle, Manager, State};
+
+const TOPIC_LIST_QUERY: &str = "WITH topic_list AS (
+         SELECT t.topic_id, t.title, t.created_at, t.locked, t.unread, t.unread_count, t.msg_count,
+            CASE
+                WHEN MAX(m.updated_at) IS NULL
+                    THEN COALESCE(NULLIF(t.updated_at, 0), t.created_at)
+                WHEN COALESCE(NULLIF(t.updated_at, 0), t.created_at) >= MAX(m.updated_at)
+                    THEN COALESCE(NULLIF(t.updated_at, 0), t.created_at)
+                ELSE MAX(m.updated_at)
+            END AS list_updated_at
+         FROM topics t
+         LEFT JOIN messages m
+           ON m.owner_type = t.owner_type AND m.owner_id = t.owner_id
+          AND m.topic_id = t.topic_id AND m.deleted_at IS NULL
+         WHERE t.owner_id = ? AND t.owner_type = ? AND t.deleted_at IS NULL
+         GROUP BY t.owner_type, t.owner_id, t.topic_id
+     )
+     SELECT * FROM topic_list
+     ORDER BY CASE ? WHEN 1 THEN list_updated_at ELSE created_at END DESC,
+              created_at DESC, topic_id DESC";
+
+#[derive(Debug, serde::Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TopicSortMode {
+    #[default]
+    Created,
+    Updated,
+}
+
+impl TopicSortMode {
+    fn query_code(self) -> i32 {
+        match self {
+            Self::Created => 0,
+            Self::Updated => 1,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicListItemDto {
+    #[serde(flatten)]
+    pub topic: Topic,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicUnreadMutationDto {
+    pub unread_count: i32,
+    pub updated_at: Option<i64>,
+}
+
+fn topic_list_item_from_row(row: &SqliteRow, owner_id: &str, owner_type: &str) -> TopicListItemDto {
+    TopicListItemDto {
+        topic: Topic {
+            id: row.get("topic_id"),
+            name: row.get("title"),
+            created_at: row.get("created_at"),
+            locked: row.get::<i32, _>("locked") != 0,
+            unread: row.get::<i32, _>("unread") != 0,
+            unread_count: row.get("unread_count"),
+            msg_count: row.get("msg_count"),
+            owner_id: owner_id.to_string(),
+            owner_type: owner_type.to_string(),
+        },
+        updated_at: row.get("list_updated_at"),
+    }
+}
 
 /// 批量获取所有 owner 的未读计数，替代前端的 N+1 查询
 #[tauri::command]
@@ -64,36 +133,21 @@ pub async fn get_topics(
     db_state: State<'_, DbState>,
     owner_id: String,
     owner_type: String,
-) -> Result<Vec<Topic>, String> {
+    sort_mode: Option<TopicSortMode>,
+) -> Result<Vec<TopicListItemDto>, String> {
     let pool = &db_state.pool;
-    let rows = sqlx::query(
-        "SELECT topic_id, title, created_at, locked, unread, unread_count, msg_count 
-         FROM topics 
-         WHERE owner_id = ? AND owner_type = ? AND deleted_at IS NULL 
-         ORDER BY created_at DESC",
-    )
-    .bind(&owner_id)
-    .bind(&owner_type)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let mut topics = Vec::new();
-    for row in rows {
-        use sqlx::Row;
-        topics.push(Topic {
-            id: row.get("topic_id"),
-            name: row.get("title"),
-            created_at: row.get("created_at"),
-            locked: row.get::<i32, _>("locked") != 0,
-            unread: row.get::<i32, _>("unread") != 0,
-            unread_count: row.get("unread_count"),
-            msg_count: row.get("msg_count"),
-            owner_id: owner_id.clone(),
-            owner_type: owner_type.clone(),
-        });
-    }
-    Ok(topics)
+    sqlx::query(TOPIC_LIST_QUERY)
+        .bind(&owner_id)
+        .bind(&owner_type)
+        .bind(sort_mode.unwrap_or_default().query_code())
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| topic_list_item_from_row(row, &owner_id, &owner_type))
+                .collect()
+        })
 }
 
 #[tauri::command]
@@ -101,18 +155,15 @@ pub async fn get_topics_streamed(
     db_state: State<'_, DbState>,
     owner_id: String,
     owner_type: String,
-    on_chunk: Channel<Vec<Topic>>,
+    sort_mode: Option<TopicSortMode>,
+    on_chunk: Channel<Vec<TopicListItemDto>>,
 ) -> Result<(), String> {
     let pool = &db_state.pool;
-    let mut rows = sqlx::query(
-        "SELECT topic_id, title, created_at, locked, unread, unread_count, msg_count 
-         FROM topics 
-         WHERE owner_id = ? AND owner_type = ? AND deleted_at IS NULL 
-         ORDER BY created_at DESC",
-    )
-    .bind(&owner_id)
-    .bind(&owner_type)
-    .fetch(pool);
+    let mut rows = sqlx::query(TOPIC_LIST_QUERY)
+        .bind(&owner_id)
+        .bind(&owner_type)
+        .bind(sort_mode.unwrap_or_default().query_code())
+        .fetch(pool);
 
     use futures_util::StreamExt;
     let mut chunk = Vec::new();
@@ -120,18 +171,7 @@ pub async fn get_topics_streamed(
 
     while let Some(row_result) = rows.next().await {
         let row = row_result.map_err(|e| e.to_string())?;
-        use sqlx::Row;
-        chunk.push(Topic {
-            id: row.get("topic_id"),
-            name: row.get("title"),
-            created_at: row.get("created_at"),
-            locked: row.get::<i32, _>("locked") != 0,
-            unread: row.get::<i32, _>("unread") != 0,
-            unread_count: row.get("unread_count"),
-            msg_count: row.get("msg_count"),
-            owner_id: owner_id.clone(),
-            owner_type: owner_type.clone(),
-        });
+        chunk.push(topic_list_item_from_row(&row, &owner_id, &owner_type));
 
         if chunk.len() >= chunk_size {
             on_chunk.send(chunk.clone()).map_err(|e| e.to_string())?;
@@ -207,14 +247,33 @@ pub async fn delete_topic(
     owner_id: String,
     owner_type: String,
     topic_id: String,
-) -> Result<(), String> {
+) -> Result<Option<Topic>, String> {
     let now = chrono::Utc::now().timestamp_millis();
     let key = TopicKey::new(&owner_type, &owner_id, &topic_id);
-    let deletion = delete_topic_data(&db_state.pool, &key, now)
+    let replacement = Topic {
+        id: if owner_type == "group" {
+            format!("group_topic_{now}")
+        } else {
+            format!("topic_{now}")
+        },
+        name: if owner_type == "group" {
+            "主要群聊".to_string()
+        } else {
+            "主要对话".to_string()
+        },
+        created_at: now,
+        locked: true,
+        unread: false,
+        unread_count: 0,
+        msg_count: 0,
+        owner_id: owner_id.clone(),
+        owner_type: owner_type.clone(),
+    };
+    let deletion = delete_topic_data_inner(&db_state.pool, &key, now, Some(replacement))
         .await?
         .ok_or_else(|| format!("Topic {topic_id} does not exist"))?;
     if !deletion.deleted {
-        return Ok(());
+        return Ok(None);
     }
 
     for message_key in deletion.active_messages {
@@ -234,18 +293,28 @@ pub async fn delete_topic(
         });
     }
 
-    Ok(())
+    Ok(deletion.replacement)
 }
 
 pub(crate) struct TopicDeletionResult {
     pub active_messages: Vec<MessageKey>,
     pub deleted: bool,
+    pub replacement: Option<Topic>,
 }
 
 pub(crate) async fn delete_topic_data(
     pool: &sqlx::SqlitePool,
     key: &TopicKey,
     deleted_at: i64,
+) -> Result<Option<TopicDeletionResult>, String> {
+    delete_topic_data_inner(pool, key, deleted_at, None).await
+}
+
+async fn delete_topic_data_inner(
+    pool: &sqlx::SqlitePool,
+    key: &TopicKey,
+    deleted_at: i64,
+    replacement_if_last: Option<Topic>,
 ) -> Result<Option<TopicDeletionResult>, String> {
     if key.owner_type.is_empty()
         || key.owner_id.is_empty()
@@ -277,8 +346,26 @@ pub(crate) async fn delete_topic_data(
         return Ok(Some(TopicDeletionResult {
             active_messages: Vec::new(),
             deleted: false,
+            replacement: None,
         }));
     }
+
+    let replacement = if let Some(candidate) = replacement_if_last {
+        let live_siblings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM topics
+             WHERE owner_type = ? AND owner_id = ? AND topic_id <> ?
+               AND deleted_at IS NULL",
+        )
+        .bind(&key.owner_type)
+        .bind(&key.owner_id)
+        .bind(&key.topic_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        (live_siblings == 0).then_some(candidate)
+    } else {
+        None
+    };
 
     let active_ids: Vec<String> = sqlx::query_scalar(
         "SELECT msg_id FROM active_generations
@@ -352,6 +439,30 @@ pub(crate) async fn delete_topic_data(
     .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
+
+    if let Some(topic) = &replacement {
+        sqlx::query(
+            "INSERT INTO topics (
+                topic_id, owner_id, owner_type, title, created_at, updated_at,
+                msg_count, locked, unread, unread_count
+             ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, 0, 0)",
+        )
+        .bind(&topic.id)
+        .bind(&topic.owner_id)
+        .bind(&topic.owner_type)
+        .bind(&topic.name)
+        .bind(topic.created_at)
+        .bind(topic.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        HashAggregator::bubble_topic_hash(
+            &mut tx,
+            &TopicKey::new(&topic.owner_type, &topic.owner_id, &topic.id),
+        )
+        .await?;
+    }
+
     match key.owner_type.as_str() {
         "agent" => HashAggregator::bubble_agent_hash(&mut tx, &key.owner_id).await?,
         "group" => HashAggregator::bubble_group_hash(&mut tx, &key.owner_id).await?,
@@ -369,6 +480,7 @@ pub(crate) async fn delete_topic_data(
             .map(|msg_id| MessageKey::new(key.clone(), msg_id))
             .collect(),
         deleted: true,
+        replacement,
     }))
 }
 
@@ -381,7 +493,7 @@ pub async fn update_topic_title(
     topic_id: String,
     title: String,
     expected_title: Option<String>,
-) -> Result<bool, String> {
+) -> Result<Option<i64>, String> {
     let now = crate::vcp_modules::infra::utils::now_millis();
 
     let mut tx = db_state.pool.begin().await.map_err(|e| e.to_string())?;
@@ -409,7 +521,7 @@ pub async fn update_topic_title(
     }
     tx.commit().await.map_err(|e| e.to_string())?;
 
-    Ok(changed.rows_affected() == 1)
+    Ok((changed.rows_affected() == 1).then_some(now))
 }
 
 #[tauri::command]
@@ -440,7 +552,7 @@ pub async fn toggle_topic_lock(
     owner_type: String,
     topic_id: String,
     locked: bool,
-) -> Result<(), String> {
+) -> Result<Option<i64>, String> {
     let now = crate::vcp_modules::infra::utils::now_millis();
 
     let mut tx = db_state.pool.begin().await.map_err(|e| e.to_string())?;
@@ -464,7 +576,7 @@ pub async fn toggle_topic_lock(
     }
     tx.commit().await.map_err(|e| e.to_string())?;
 
-    Ok(())
+    Ok((changed.rows_affected() == 1).then_some(now))
 }
 
 #[tauri::command]
@@ -475,7 +587,7 @@ pub async fn set_topic_unread(
     owner_type: String,
     topic_id: String,
     unread: bool,
-) -> Result<(), String> {
+) -> Result<Option<i64>, String> {
     let key = TopicKey::new(owner_type, owner_id, topic_id);
     set_topic_unread_in_pool(&db_state.pool, &key, unread).await
 }
@@ -491,7 +603,7 @@ async fn set_topic_unread_in_pool(
     pool: &sqlx::SqlitePool,
     key: &TopicKey,
     unread: bool,
-) -> Result<(), String> {
+) -> Result<Option<i64>, String> {
     validate_agent_topic_key(key)?;
     let unread_int = if unread { 1 } else { 0 };
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
@@ -510,13 +622,14 @@ async fn set_topic_unread_in_pool(
         .map_err(|e| e.to_string())?;
     }
 
+    let now = crate::vcp_modules::infra::utils::now_millis();
     let changed = sqlx::query(
         "UPDATE topics SET unread = ?, updated_at = ?
          WHERE owner_type = ? AND owner_id = ? AND topic_id = ?
            AND deleted_at IS NULL AND unread IS NOT ?",
     )
     .bind(unread_int)
-    .bind(crate::vcp_modules::infra::utils::now_millis())
+    .bind(now)
     .bind(&key.owner_type)
     .bind(&key.owner_id)
     .bind(&key.topic_id)
@@ -530,7 +643,7 @@ async fn set_topic_unread_in_pool(
     }
     tx.commit().await.map_err(|e| e.to_string())?;
 
-    Ok(())
+    Ok((changed.rows_affected() == 1).then_some(now))
 }
 
 #[tauri::command]
@@ -539,7 +652,7 @@ pub async fn increment_topic_unread_count(
     owner_id: String,
     owner_type: String,
     topic_id: String,
-) -> Result<i32, String> {
+) -> Result<TopicUnreadMutationDto, String> {
     let key = TopicKey::new(owner_type, owner_id, topic_id);
     validate_agent_topic_key(&key)?;
 
@@ -561,12 +674,13 @@ pub async fn increment_topic_unread_count(
         ));
     }
 
+    let now = crate::vcp_modules::infra::utils::now_millis();
     let promoted = sqlx::query(
         "UPDATE topics SET unread = 1, updated_at = ?
          WHERE owner_type = ? AND owner_id = ? AND topic_id = ?
            AND deleted_at IS NULL AND unread IS NOT 1",
     )
-    .bind(crate::vcp_modules::infra::utils::now_millis())
+    .bind(now)
     .bind(&key.owner_type)
     .bind(&key.owner_id)
     .bind(&key.topic_id)
@@ -589,7 +703,10 @@ pub async fn increment_topic_unread_count(
     .map_err(|e| e.to_string())?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
-    Ok(unread_count)
+    Ok(TopicUnreadMutationDto {
+        unread_count,
+        updated_at: (promoted.rows_affected() == 1).then_some(now),
+    })
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -830,6 +947,10 @@ pub async fn regenerate_topic_response(
     let settings =
         crate::vcp_modules::settings_manager::read_settings(app_handle.clone(), settings_state)
             .await?;
+    let connection = crate::vcp_modules::vcp_client::freeze_chat_connection(
+        &settings,
+        crate::vcp_modules::vcp_client::ChatRequestPurpose::Interactive,
+    )?;
 
     match owner_type.as_str() {
         "agent" => {
@@ -905,9 +1026,8 @@ pub async fn regenerate_topic_response(
                 agent_id: owner_id,
                 topic_id: topic_id.clone(),
                 user_message: chat_msg,
-                vcp_url: settings.vcp_server_url,
-                vcp_api_key: settings.vcp_api_key,
             },
+            connection,
             stream_channel,
             false, // skip append_user_msg
         )
@@ -924,8 +1044,7 @@ pub async fn regenerate_topic_response(
                 group_id: owner_id,
                 topic_id: topic_id.clone(),
                 user_message: chat_msg,
-                vcp_url: settings.vcp_server_url,
-                vcp_api_key: settings.vcp_api_key,
+                connection,
                 stream_channel: Some(stream_channel),
             },
             false, // skip append_user_msg
@@ -959,6 +1078,147 @@ pub async fn regenerate_topic_response(
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn topic_list_updated_at_uses_live_messages_and_exact_fallbacks() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open test database");
+        sqlx::raw_sql(include_str!("../../../migrations/0100_baseline_v2.sql"))
+            .execute(&pool)
+            .await
+            .expect("create current baseline schema");
+        sqlx::raw_sql(
+            "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
+             VALUES ('agent', 'agent', 'Agent', 'model', 1);
+             INSERT INTO topics (
+                topic_id, owner_type, owner_id, title, created_at, updated_at
+             ) VALUES
+                ('message-newer', 'agent', 'agent', 'Message', 100, 150),
+                ('metadata-newer', 'agent', 'agent', 'Metadata', 300, 450),
+                ('created-fallback', 'agent', 'agent', 'Created', 500, 0),
+                ('tie-b', 'agent', 'agent', 'Tie B', 50, 50),
+                ('tie-a', 'agent', 'agent', 'Tie A', 50, 50);
+             INSERT INTO messages (
+                owner_type, owner_id, topic_id, msg_id, role, content, timestamp,
+                created_at, updated_at, deleted_at
+             ) VALUES
+                ('agent', 'agent', 'message-newer', 'live', 'user', 'live', 600, 600, 700, NULL),
+                ('agent', 'agent', 'message-newer', 'deleted', 'user', 'deleted', 800, 800, 900, 901);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed topic activity");
+
+        let projected: i64 = sqlx::query_scalar(
+            "SELECT last_message_updated_at FROM topics
+             WHERE owner_type = 'agent' AND owner_id = 'agent' AND topic_id = 'message-newer'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read materialized activity");
+        assert_eq!(projected, 0);
+        assert!(TOPIC_LIST_QUERY.contains("LEFT JOIN messages"));
+
+        let rows = sqlx::query(TOPIC_LIST_QUERY)
+            .bind("agent")
+            .bind("agent")
+            .bind(TopicSortMode::Created.query_code())
+            .fetch_all(&pool)
+            .await
+            .expect("load topic list");
+        let items: Vec<TopicListItemDto> = rows
+            .iter()
+            .map(|row| topic_list_item_from_row(row, "agent", "agent"))
+            .collect();
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.topic.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "created-fallback",
+                "metadata-newer",
+                "message-newer",
+                "tie-b",
+                "tie-a",
+            ]
+        );
+        assert_eq!(items[0].updated_at, 500);
+        assert_eq!(items[1].updated_at, 450);
+        assert_eq!(items[2].updated_at, 700);
+        let serialized = serde_json::to_value(&items[2]).expect("serialize topic list item");
+        assert_eq!(serialized["id"], "message-newer");
+        assert_eq!(serialized["updatedAt"], 700);
+
+        let rows = sqlx::query(TOPIC_LIST_QUERY)
+            .bind("agent")
+            .bind("agent")
+            .bind(TopicSortMode::Updated.query_code())
+            .fetch_all(&pool)
+            .await
+            .expect("load topic list by activity");
+        let updated_items: Vec<TopicListItemDto> = rows
+            .iter()
+            .map(|row| topic_list_item_from_row(row, "agent", "agent"))
+            .collect();
+        assert_eq!(
+            updated_items
+                .iter()
+                .map(|item| item.topic.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "message-newer",
+                "created-fallback",
+                "metadata-newer",
+                "tie-b",
+                "tie-a",
+            ]
+        );
+
+        sqlx::query(
+            "UPDATE messages SET deleted_at = 1000
+             WHERE owner_type = 'agent' AND owner_id = 'agent'
+               AND topic_id = 'message-newer' AND msg_id = 'live'",
+        )
+        .execute(&pool)
+        .await
+        .expect("tombstone latest live message");
+
+        let rows = sqlx::query(TOPIC_LIST_QUERY)
+            .bind("agent")
+            .bind("agent")
+            .bind(TopicSortMode::Updated.query_code())
+            .fetch_all(&pool)
+            .await
+            .expect("reload topic list after tombstone");
+        let item = rows
+            .iter()
+            .map(|row| topic_list_item_from_row(row, "agent", "agent"))
+            .find(|item| item.topic.id == "message-newer")
+            .expect("message topic remains live");
+        assert_eq!(item.updated_at, 150);
+
+        let mut tx = pool.begin().await.expect("begin projection repair");
+        HashAggregator::bubble_topic_hash(
+            &mut tx,
+            &TopicKey::new("agent", "agent", "message-newer"),
+        )
+        .await
+        .expect("repair activity after deletion");
+        tx.commit().await.expect("commit projection repair");
+        let repaired: i64 = sqlx::query_scalar(
+            "SELECT last_message_updated_at FROM topics
+             WHERE owner_type = 'agent' AND owner_id = 'agent' AND topic_id = 'message-newer'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read repaired activity");
+        assert_eq!(repaired, 0);
+    }
 
     #[tokio::test]
     async fn agent_topic_unread_change_advances_config_and_bubbles_owner() {
@@ -1025,5 +1285,81 @@ mod tests {
         .await
         .expect("read repeated state");
         assert_eq!(repeated, changed);
+    }
+
+    #[tokio::test]
+    async fn local_last_topic_delete_replaces_identity_but_sync_delete_stays_exact() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open test database");
+        sqlx::raw_sql(include_str!("../../../migrations/0100_baseline_v2.sql"))
+            .execute(&pool)
+            .await
+            .expect("create current baseline schema");
+        sqlx::query(
+            "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
+             VALUES ('agent', 'agent', 'Agent', 'model', 1);
+             INSERT INTO topics (
+                topic_id, owner_type, owner_id, title, created_at, updated_at
+             ) VALUES ('default', 'agent', 'agent', 'Default', 1, 1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed owner and last topic");
+
+        let deleted_key = TopicKey::new("agent", "agent", "default");
+        let replacement = Topic {
+            id: "topic_10".to_string(),
+            name: "主要对话".to_string(),
+            created_at: 10,
+            locked: true,
+            unread: false,
+            unread_count: 0,
+            msg_count: 0,
+            owner_id: "agent".to_string(),
+            owner_type: "agent".to_string(),
+        };
+        let local_delete =
+            delete_topic_data_inner(&pool, &deleted_key, 10, Some(replacement.clone()))
+                .await
+                .expect("delete local last topic")
+                .expect("existing topic deletion");
+        let actual_replacement = local_delete.replacement.expect("replacement topic");
+        assert_eq!(actual_replacement.id, replacement.id);
+        assert_eq!(actual_replacement.owner_id, replacement.owner_id);
+        assert_eq!(actual_replacement.owner_type, replacement.owner_type);
+
+        let states: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT topic_id, deleted_at FROM topics
+             WHERE owner_type = 'agent' AND owner_id = 'agent'
+             ORDER BY topic_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read topic states");
+        assert_eq!(
+            states,
+            vec![
+                ("default".to_string(), Some(10)),
+                ("topic_10".to_string(), None),
+            ]
+        );
+
+        let exact_delete =
+            delete_topic_data(&pool, &TopicKey::new("agent", "agent", "topic_10"), 20)
+                .await
+                .expect("apply exact synchronized deletion")
+                .expect("replacement topic exists");
+        assert!(exact_delete.replacement.is_none());
+        let live_topics: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM topics
+             WHERE owner_type = 'agent' AND owner_id = 'agent' AND deleted_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count live topics");
+        assert_eq!(live_topics, 0);
     }
 }

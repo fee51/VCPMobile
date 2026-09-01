@@ -171,6 +171,7 @@ date: 2026-08-13
 - **时长**：400ms
 - **缓动**：`cubic-bezier(0.16, 1, 0.3, 1)` — 带轻微过冲的减速曲线，使滑入更具物理感
 - **属性**：仅 `transform`（GPU 合成层，避免重排）
+- **边缘阴影**：静态渐变层常驻，仅动画 `opacity`；关闭时在 280ms 内淡出，早于 `visibility` 隐藏
 - **层级**：语义化 `z-drawer`（`var(--layer-drawer)` = 20），位于 `content`（0）之上、`overlay`（30）之下
 
 **大宽度 Android 窗口常驻**（`@media (min-width: 1024px)`）：
@@ -481,14 +482,15 @@ const refreshUnreadCounts = async () => {
 
 ### 6.1 SortableJS 集成
 
-`AgentList.vue` 在 `onMounted` 生命周期中为 Group 列表和 Agent 列表分别初始化 `Sortable` 实例：
+`AgentList.vue` 让 Group/Agent 两个 `Sortable` 实例跟随真实列表 DOM 的生命周期。模板 ref 出现时创建，loading、空列表或 Tab 切换导致 ref 消失时立即销毁，随后 DOM 重建会自动重新绑定：
 
 ```ts
-import Sortable from "sortablejs";
+watch(agentListRef, (element) => {
+  agentSortable?.destroy();
+  agentSortable = element ? createSortable(element, "agent") : null;
+}, { flush: "post" });
 
-onMounted(() => {
-  initSortable();
-});
+onUnmounted(() => agentSortable?.destroy());
 ```
 
 > 源码位置：`src/features/agent/AgentList.vue` 第 138–140 行
@@ -505,11 +507,14 @@ onMounted(() => {
 | `direction` | `"vertical"` | 垂直排序 |
 | `forceFallback` | `true` | 使用自定义拖拽代理（移动端兼容性更好） |
 | `fallbackOnBody` | `true` | 拖拽代理挂载到 body |
+| `disabled` | 搜索词非空时为 `true` | 过滤列表的 DOM 下标不等于完整顺序下标，搜索时禁止重排 |
 | `ghostClass` | `"opacity-50"` | 被拖拽元素的半透明样式 |
 
 > 源码位置：`src/features/agent/AgentList.vue` 第 70–136 行
 
 **延迟设计的核心目的**：`delay: 200` + `delayOnTouchOnly: true` 是为了给 Swipe 手势留出判定窗口。如果用户意图是水平滑动展开编辑按钮，手指在 200ms 内移动的水平距离会触发 Swipe 逻辑，而 SortableJS 因延迟未启动，从而避免两种手势的冲突。
+
+实例不能只在组件 mounted 时创建一次：助手快照刷新会临时切换 `assistantStore.loading`，从而替换列表 DOM。绑定在旧节点上的实例必须销毁，并在新节点出现后重建，否则会出现首次进入无法长按拖动、重新挂载后恢复的时序故障。
 
 ### 6.2 排序变更的本地更新
 
@@ -700,7 +705,7 @@ if (shouldKeepOpen) {
 **与排序的互斥**：
 - `onChoose`（SortableJS 开始拖拽）时设置 `isSorting = true`，同时强制 `activeSwipeId = null`
 - `onTouchStart` 中若 `isSorting.value` 为真，直接返回，不进入 Swipe 逻辑
-- `onTouchMove` 中若 `isSorting.value` 为真，调用 `e.preventDefault()` + `e.stopPropagation()`，绝对防止排序期间的手指滑动误触外层
+- `onTouchMove` 中若 `isSorting.value` 为真，直接把移动事件留给 SortableJS，不再进入卡片 Swipe 计算
 
 ---
 

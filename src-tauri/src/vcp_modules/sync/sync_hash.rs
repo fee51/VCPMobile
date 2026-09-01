@@ -1,20 +1,63 @@
+use crate::vcp_modules::group_types::parse_member_tags;
 use crate::vcp_modules::sync_dto::{
     AgentSyncDTO, AgentTopicSyncDTO, GroupSyncDTO, GroupTopicSyncDTO,
 };
 use crate::vcp_modules::sync_types::{compute_deterministic_hash, compute_merkle_root};
-use crate::vcp_modules::topic_types::TopicKey;
+use crate::vcp_modules::topic_types::{
+    resolve_topic_activity_updated_at, TopicActivityDto, TopicKey,
+};
 
 use sqlx::{Row, Sqlite, Transaction};
 
 pub struct HashAggregator;
 
 impl HashAggregator {
+    pub async fn load_topic_activity(
+        tx: &mut Transaction<'_, Sqlite>,
+        key: &TopicKey,
+    ) -> Result<TopicActivityDto, String> {
+        let row = sqlx::query(
+            "SELECT msg_count, updated_at, last_message_updated_at, created_at
+             FROM topics
+             WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND deleted_at IS NULL",
+        )
+        .bind(&key.owner_type)
+        .bind(&key.owner_id)
+        .bind(&key.topic_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        let topic_updated_at: i64 = row
+            .try_get("updated_at")
+            .map_err(|error| format!("Topic {} updated_at decode failed: {error}", key.topic_id))?;
+        let last_message_updated_at: i64 =
+            row.try_get("last_message_updated_at").map_err(|error| {
+                format!(
+                    "Topic {} last_message_updated_at decode failed: {error}",
+                    key.topic_id
+                )
+            })?;
+        let created_at: i64 = row
+            .try_get("created_at")
+            .map_err(|error| format!("Topic {} created_at decode failed: {error}", key.topic_id))?;
+        Ok(TopicActivityDto {
+            msg_count: row.try_get("msg_count").map_err(|error| {
+                format!("Topic {} msg_count decode failed: {error}", key.topic_id)
+            })?,
+            updated_at: resolve_topic_activity_updated_at(
+                topic_updated_at,
+                last_message_updated_at,
+                created_at,
+            ),
+        })
+    }
+
     async fn compute_topic_content_aggregate(
         tx: &mut Transaction<'_, Sqlite>,
         key: &TopicKey,
-    ) -> Result<(String, i32), String> {
+    ) -> Result<(String, i32, i64), String> {
         let rows = sqlx::query(
-            "SELECT msg_id, content_hash FROM messages
+            "SELECT msg_id, content_hash, updated_at FROM messages
              WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND deleted_at IS NULL",
         )
         .bind(&key.owner_type)
@@ -27,6 +70,7 @@ impl HashAggregator {
         let msg_count = i32::try_from(rows.len())
             .map_err(|_| format!("Topic {} message count exceeds i32", key.topic_id))?;
         let mut hashes = Vec::with_capacity(rows.len());
+        let mut last_message_updated_at = 0_i64;
         for row in rows {
             let message_id: String = row.try_get("msg_id").map_err(|error| {
                 format!("Topic {} message id decode failed: {error}", key.topic_id)
@@ -34,9 +78,20 @@ impl HashAggregator {
             let message_hash: String = row.try_get("content_hash").map_err(|error| {
                 format!("Topic {} message hash decode failed: {error}", key.topic_id)
             })?;
+            let message_updated_at: i64 = row.try_get("updated_at").map_err(|error| {
+                format!(
+                    "Topic {} message updated_at decode failed: {error}",
+                    key.topic_id
+                )
+            })?;
+            last_message_updated_at = last_message_updated_at.max(message_updated_at);
             hashes.push(Self::compute_message_leaf_hash(&message_id, &message_hash));
         }
-        Ok((compute_merkle_root(hashes), msg_count))
+        Ok((
+            compute_merkle_root(hashes),
+            msg_count,
+            last_message_updated_at,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -49,8 +104,11 @@ impl HashAggregator {
         agent_id: Option<&str>,
         attachment_hashes: &[String],
     ) -> String {
-        let mut sorted_hashes = attachment_hashes.to_vec();
-        sorted_hashes.sort();
+        let mut sorted_hashes = attachment_hashes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        sorted_hashes.sort_unstable();
 
         let mut fingerprint_map = serde_json::Map::new();
         fingerprint_map.insert(
@@ -84,7 +142,12 @@ impl HashAggregator {
         if !sorted_hashes.is_empty() {
             fingerprint_map.insert(
                 "attachmentHashes".to_string(),
-                serde_json::to_value(sorted_hashes).unwrap(),
+                serde_json::Value::Array(
+                    sorted_hashes
+                        .into_iter()
+                        .map(|hash| serde_json::Value::String(hash.to_string()))
+                        .collect(),
+                ),
             );
         }
 
@@ -153,7 +216,7 @@ impl HashAggregator {
             "name": &dto.name,
             "members": &dto.members,
             "mode": &dto.mode,
-            "memberTags": dto.member_tags.clone().unwrap_or_else(|| serde_json::json!({})),
+            "memberTags": dto.member_tags.clone().unwrap_or_default(),
             "groupPrompt": dto.group_prompt.as_deref().unwrap_or(""),
             "invitePrompt": dto.invite_prompt.as_deref().unwrap_or(
                 "现在轮到你{{VCPChatAgentName}}发言了。系统已经为大家添加[xxx的发言：]这样的标记头，以用于区分不同发言来自谁。大家不用自己再输出自己的发言标记头，也不需要讨论发言标记系统，正常聊天即可。",
@@ -247,8 +310,9 @@ impl HashAggregator {
     pub async fn bubble_topic_hash(
         tx: &mut Transaction<'_, Sqlite>,
         key: &TopicKey,
-    ) -> Result<i32, String> {
-        let (root_hash, msg_count) = Self::compute_topic_content_aggregate(tx, key).await?;
+    ) -> Result<TopicActivityDto, String> {
+        let (root_hash, msg_count, last_message_updated_at) =
+            Self::compute_topic_content_aggregate(tx, key).await?;
         let config_hash = if key.owner_type == "agent" {
             let dto = SyncDtoLoader::load_agent_topic_dto(tx, key).await?;
             Self::compute_agent_topic_metadata_hash(&dto)
@@ -263,12 +327,14 @@ impl HashAggregator {
         };
 
         let updated = sqlx::query(
-            "UPDATE topics SET content_hash = ?, config_hash = ?, msg_count = ?
+            "UPDATE topics SET content_hash = ?, config_hash = ?, msg_count = ?,
+                 last_message_updated_at = ?
              WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND deleted_at IS NULL",
         )
         .bind(root_hash)
         .bind(config_hash)
         .bind(msg_count)
+        .bind(last_message_updated_at)
         .bind(&key.owner_type)
         .bind(&key.owner_id)
         .bind(&key.topic_id)
@@ -281,7 +347,7 @@ impl HashAggregator {
                 key.topic_id
             ));
         }
-        Ok(msg_count)
+        Self::load_topic_activity(tx, key).await
     }
 
     pub async fn bubble_topic_hash_with_meta(
@@ -291,9 +357,10 @@ impl HashAggregator {
         created_at: i64,
         locked: bool,
         unread: bool,
-    ) -> Result<i32, String> {
-        // 1. 一次消息扫描同时计算 content_hash 与 msg_count
-        let (root_hash, msg_count) = Self::compute_topic_content_aggregate(tx, key).await?;
+    ) -> Result<TopicActivityDto, String> {
+        // 1. 一次消息扫描同时计算 content_hash、msg_count 与列表更新时间投影
+        let (root_hash, msg_count, last_message_updated_at) =
+            Self::compute_topic_content_aggregate(tx, key).await?;
 
         // 2. 直接根据外部传入的元数据参数计算 config_hash (省去 2 次 SELECT)
         let config_hash = if key.owner_type == "agent" {
@@ -322,12 +389,14 @@ impl HashAggregator {
         };
 
         let updated = sqlx::query(
-            "UPDATE topics SET content_hash = ?, config_hash = ?, msg_count = ?
+            "UPDATE topics SET content_hash = ?, config_hash = ?, msg_count = ?,
+                 last_message_updated_at = ?
              WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND deleted_at IS NULL",
         )
         .bind(root_hash)
         .bind(config_hash)
         .bind(msg_count)
+        .bind(last_message_updated_at)
         .bind(&key.owner_type)
         .bind(&key.owner_id)
         .bind(&key.topic_id)
@@ -340,7 +409,7 @@ impl HashAggregator {
                 key.topic_id
             ));
         }
-        Ok(msg_count)
+        Self::load_topic_activity(tx, key).await
     }
 
     pub async fn bubble_agent_hash(
@@ -418,8 +487,8 @@ impl HashAggregator {
     pub async fn bubble_from_topic(
         tx: &mut Transaction<'_, Sqlite>,
         key: &TopicKey,
-    ) -> Result<i32, String> {
-        let msg_count = Self::bubble_topic_hash(tx, key).await?;
+    ) -> Result<TopicActivityDto, String> {
+        let activity = Self::bubble_topic_hash(tx, key).await?;
 
         if key.owner_type == "agent" {
             Self::bubble_agent_hash(tx, &key.owner_id).await?;
@@ -432,7 +501,7 @@ impl HashAggregator {
             ));
         }
 
-        Ok(msg_count)
+        Ok(activity)
     }
 }
 
@@ -528,7 +597,7 @@ impl SyncDtoLoader {
         let member_tags_raw: String = row
             .try_get("member_tags")
             .map_err(|error| format!("Group {group_id} memberTags decode failed: {error}"))?;
-        let member_tags = serde_json::from_str(&member_tags_raw)
+        let member_tags = parse_member_tags(&member_tags_raw)
             .map_err(|error| format!("Group {group_id} memberTags JSON is invalid: {error}"))?;
 
         Ok(GroupSyncDTO {
@@ -725,7 +794,7 @@ mod tests {
             created_at: 0,
         };
         let explicit = GroupSyncDTO {
-            member_tags: Some(serde_json::json!({})),
+            member_tags: Some(Default::default()),
             group_prompt: Some(String::new()),
             invite_prompt: Some("现在轮到你{{VCPChatAgentName}}发言了。系统已经为大家添加[xxx的发言：]这样的标记头，以用于区分不同发言来自谁。大家不用自己再输出自己的发言标记头，也不需要讨论发言标记系统，正常聊天即可。".to_string()),
             unified_model: Some(String::new()),

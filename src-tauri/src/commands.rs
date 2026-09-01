@@ -32,6 +32,7 @@ macro_rules! app_command_handler {
         use crate::vcp_modules::avatar_service::{
             batch_get_avatars, get_avatar, save_avatar_data, store_dominant_color,
         };
+        use crate::vcp_modules::aurora_pipeline::rebuild_aurora_snapshot;
         use crate::vcp_modules::chat_manager::{
             append_single_message, delete_messages, load_chat_history, load_chat_history_around,
             load_chat_history_streamed, patch_single_message, truncate_history_after_message,
@@ -99,7 +100,7 @@ macro_rules! app_command_handler {
         };
         use crate::vcp_modules::sync_service::{
             clear_old_sync_logs, get_sync_session_log_path, get_sync_status, list_sync_log_files,
-            read_sync_log_file, start_manual_sync, stop_sync,
+            prepare_sync_log_share_file, read_sync_log_file, start_manual_sync, stop_sync,
         };
         use crate::vcp_modules::taskcenter::{
             delegation_cancel, delegation_list, task_agent_list, task_create, task_delete,
@@ -116,8 +117,8 @@ macro_rules! app_command_handler {
             start_update_download,
         };
         use crate::vcp_modules::vcp_client::{
-            get_active_generations, interruptGroupTurn, interruptRequest, recover_active_generation,
-            sendToVCP, test_vcp_connection,
+            get_active_generations, interruptGroupTurn, interruptRequest, preview_chat_endpoint,
+            recover_active_generation, sendToVCP, test_vcp_connection,
         };
         use crate::vcp_modules::vcp_info_service::{
             clear_vcp_info, get_vcp_info_connection_status, get_vcp_info_metadata_list,
@@ -173,12 +174,14 @@ macro_rules! app_command_handler {
                 process_message_content,
                 re_render_message,
                 rebuild_all_pre_renders,
+                rebuild_aurora_snapshot,
                 search_messages_fts,
                 truncate_history_after_message,
                 // ── VCP 连接与生成控制（vcp_client）──
                 get_active_generations,
                 interruptGroupTurn,
                 interruptRequest,
+                preview_chat_endpoint,
                 recover_active_generation,
                 sendToVCP,
                 test_vcp_connection,
@@ -331,6 +334,7 @@ macro_rules! app_command_handler {
                 get_sync_session_log_path,
                 get_sync_status,
                 list_sync_log_files,
+                prepare_sync_log_share_file,
                 read_sync_log_file,
                 start_manual_sync,
                 stop_sync,

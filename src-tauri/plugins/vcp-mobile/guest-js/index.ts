@@ -37,12 +37,22 @@ export interface PickedFile {
   thumbnailPath?: string | null;
 }
 
-export function pickFile(): Promise<PickedFile> {
-  return invoke<PickedFile>('plugin:vcp-mobile|pick_file');
+export type PickFileMode = 'file' | 'camera' | 'gallery' | 'avatar';
+
+export function pickFile(mode?: PickFileMode): Promise<PickedFile> {
+  return invoke<PickedFile>('plugin:vcp-mobile|pick_file', mode ? { mode } : undefined);
+}
+
+export function deleteTempFile(filePath: string): Promise<void> {
+  return invoke('plugin:vcp-mobile|delete_temp_file', { filePath });
 }
 
 export function openFileNative(path: string): Promise<void> {
-  return invoke('plugin:vcp-mobile|open_file_native', { path });
+  return invoke('plugin:vcp-mobile|open_file_native', { path, action: 'view' });
+}
+
+export function shareFileNative(path: string): Promise<void> {
+  return invoke('plugin:vcp-mobile|open_file_native', { path, action: 'share' });
 }
 
 export interface ApkSignatureVerification {

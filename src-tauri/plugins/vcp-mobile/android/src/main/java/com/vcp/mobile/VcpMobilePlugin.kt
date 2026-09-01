@@ -1,6 +1,7 @@
 package com.vcp.mobile
 
 import android.app.Activity
+import android.content.ClipData
 import android.content.Context
 import android.content.IntentFilter
 import android.content.res.Configuration
@@ -1463,7 +1464,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                     }
                     launchCameraIntent(invoke)
                 }
-                "gallery" -> {
+                "gallery", "avatar" -> {
                     val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
                         type = "image/*"
                         addCategory(Intent.CATEGORY_OPENABLE)
@@ -1602,11 +1603,15 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
         executePluginTask(executorDomains.fileIoExecutor, invoke, "processPickedFile", fileTask@{
             var currentTempFile: java.io.File? = null
+            var currentTranscodeSourceFile: java.io.File? = null
             var currentThumbnailFile: java.io.File? = null
+            var currentAvatarWorkFile: java.io.File? = null
             try {
                 val context = activity
                 val contentResolver = context.contentResolver
                 val stagingTicket = java.util.UUID.randomUUID().toString()
+                val mode = invoke.parseArgs(PickFileArgs::class.java).mode
+                val isAvatarMode = mode == "avatar"
 
                 // 1. 获取文件名和大小
                 var originalName = "unknown"
@@ -1625,14 +1630,16 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 Log.i(TAG, "[onPickFileResult] Processing picked file: $originalName (size=$size, mime=$mimeType)")
 
                 // 3. 发送预准备事件给前端，让前端立即创建进度卡片
-                val startDetail = JSObject().apply {
-                    put("name", originalName)
-                    put("size", size)
-                    put("mime", mimeType)
-                }
-                val safeStartDetail = escapeJsonForJsString(startDetail.toString())
-                activity.runOnUiThread {
-                    webViewRef?.evaluateJavascript("window.dispatchEvent(new CustomEvent('vcp-mobile-file-start', { detail: JSON.parse(\"$safeStartDetail\") }))", null)
+                if (!isAvatarMode) {
+                    val startDetail = JSObject().apply {
+                        put("name", originalName)
+                        put("size", size)
+                        put("mime", mimeType)
+                    }
+                    val safeStartDetail = escapeJsonForJsString(startDetail.toString())
+                    activity.runOnUiThread {
+                        webViewRef?.evaluateJavascript("window.dispatchEvent(new CustomEvent('vcp-mobile-file-start', { detail: JSON.parse(\"$safeStartDetail\") }))", null)
+                    }
                 }
 
                 // 4. 流式安全拷贝至 cacheDir 并同步计算 SHA-256 (64KB buffer)
@@ -1659,7 +1666,7 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                             totalRead += bytesRead
                             
                             val now = System.currentTimeMillis()
-                            if (now - lastReportTime > 200) {
+                            if (!isAvatarMode && now - lastReportTime > 200) {
                                 lastReportTime = now
                                 val progress = if (size > 0) ((totalRead.toDouble() / size) * 100).toInt() else 0
                                 val progressDetail = JSObject().apply {
@@ -1703,12 +1710,19 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                     val isImageOnly = isUnsupportedHeic || isUnsupportedAvif
                     val outputSuffix = if (isAudioOnly) "m4a" else if (isImageOnly) "jpg" else "mp4"
                     val transcodedFile = java.io.File(uploadsDir, "transcoded_${stagingTicket}.$outputSuffix")
+                    currentTranscodeSourceFile = tempFile
                     currentTempFile = transcodedFile
 
                     val latch = CountDownLatch(1)
-                    var transcodeError: Throwable? = null
+                    val transcodeAbandoned = java.util.concurrent.atomic.AtomicBoolean(false)
+                    val transcodeError = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+                    val transformerRef = java.util.concurrent.atomic.AtomicReference<Transformer?>(null)
 
                     activity.runOnUiThread {
+                        if (transcodeAbandoned.get()) {
+                            latch.countDown()
+                            return@runOnUiThread
+                        }
                         try {
                             val request = TransformationRequest.Builder()
                                 .setVideoMimeType(if (!isAudioOnly && !isImageOnly) MimeTypes.VIDEO_H264 else null)
@@ -1721,14 +1735,22 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                                 .addListener(object : Transformer.Listener {
                                     override fun onCompleted(composition: Composition, result: ExportResult) {
                                         latch.countDown()
+                                        if (transcodeAbandoned.get()) transcodedFile.delete()
                                     }
 
                                     override fun onError(composition: Composition, result: ExportResult, exception: ExportException) {
-                                        transcodeError = exception
+                                        transcodeError.set(exception)
                                         latch.countDown()
+                                        if (transcodeAbandoned.get()) transcodedFile.delete()
                                     }
                                 })
                                 .build()
+                            transformerRef.set(transformer)
+                            if (transcodeAbandoned.get()) {
+                                transformer.cancel()
+                                latch.countDown()
+                                return@runOnUiThread
+                            }
 
                             val mediaItem = MediaItem.fromUri(Uri.fromFile(tempFile))
                             val editedMediaItem = EditedMediaItem.Builder(mediaItem)
@@ -1737,22 +1759,35 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
                             transformer.start(editedMediaItem, transcodedFile.absolutePath)
                         } catch (e: Throwable) {
-                            transcodeError = e
+                            transcodeError.set(e)
                             latch.countDown()
+                            if (transcodeAbandoned.get()) transcodedFile.delete()
                         }
                     }
 
-                    if (!latch.await(300, java.util.concurrent.TimeUnit.SECONDS)) {
-                        transcodeError = java.util.concurrent.TimeoutException("Transcoding timed out after 5 minutes")
+                    val transcodeCompleted = try {
+                        latch.await(300, java.util.concurrent.TimeUnit.SECONDS)
+                    } catch (error: InterruptedException) {
+                        transcodeAbandoned.set(true)
+                        activity.runOnUiThread { transformerRef.get()?.cancel() }
+                        transcodedFile.delete()
+                        Thread.currentThread().interrupt()
+                        throw error
                     }
-
-                    if (transcodeError != null) {
-                        try { transcodedFile.delete() } catch (_: Exception) {}
-                        throw transcodeError!!
+                    if (!transcodeCompleted) {
+                        transcodeAbandoned.set(true)
+                        activity.runOnUiThread { transformerRef.get()?.cancel() }
+                        transcodedFile.delete()
+                        throw java.util.concurrent.TimeoutException("Transcoding timed out after 5 minutes")
                     }
+                    transcodeError.get()?.let { throw it }
 
                     // 转码成功，物理删除原格式的临时文件以释放空间
-                    try { tempFile.delete() } catch (_: Exception) {}
+                    if (!tempFile.delete()) {
+                        transcodedFile.delete()
+                        throw IllegalStateException("Failed to delete transcoded source staging file")
+                    }
+                    currentTranscodeSourceFile = null
 
                     // 重新计算转码后文件的 CAS SHA-256 哈希
                     val newDigest = java.security.MessageDigest.getInstance("SHA-256")
@@ -1799,6 +1834,73 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
                 val finalSize = if (size > 0) size else ownedFinalTempFile.length()
 
+                // Avatar 专用模式：原图只在 Native 层流式落盘，采样完成后立即删除。
+                // WebView 只接收最长边 1120px 的受控工作副本，不触发附件事件。
+                if (isAvatarMode) {
+                    val processLatch = CountDownLatch(1)
+                    val preparationAbandoned = java.util.concurrent.atomic.AtomicBoolean(false)
+                    val processedPath = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                    val processError = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+                    MediaBridge.processImageAsync(ownedFinalTempFile.absolutePath, context) { processResult ->
+                        processResult
+                            .onSuccess { processedPath.set(it) }
+                            .onFailure { processError.set(it) }
+                        processLatch.countDown()
+                        if (preparationAbandoned.get()) {
+                            processedPath.getAndSet(null)?.let { java.io.File(it).delete() }
+                        }
+                    }
+                    val processCompleted = try {
+                        processLatch.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                    } catch (error: InterruptedException) {
+                        preparationAbandoned.set(true)
+                        processedPath.getAndSet(null)?.let { java.io.File(it).delete() }
+                        Thread.currentThread().interrupt()
+                        throw error
+                    }
+                    if (!processCompleted) {
+                        preparationAbandoned.set(true)
+                        processedPath.getAndSet(null)?.let { java.io.File(it).delete() }
+                        throw java.util.concurrent.TimeoutException("Avatar image preparation timed out")
+                    }
+                    processError.get()?.let { throw it }
+
+                    val avatarWorkFile = processedPath.getAndSet(null)?.let { java.io.File(it) }
+                        ?: throw IllegalStateException("Avatar image preparation returned no path")
+                    if (!avatarWorkFile.exists() || avatarWorkFile.length() <= 0L) {
+                        avatarWorkFile.delete()
+                        throw IllegalStateException("Avatar image preparation returned an invalid file")
+                    }
+                    currentAvatarWorkFile = avatarWorkFile
+
+                    val avatarDigest = java.security.MessageDigest.getInstance("SHA-256")
+                    java.io.FileInputStream(avatarWorkFile).use { input ->
+                        val buffer = ByteArray(65536)
+                        var bytesRead: Int
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            avatarDigest.update(buffer, 0, bytesRead)
+                        }
+                    }
+                    val avatarHash = avatarDigest.digest().joinToString("") { "%02x".format(it) }
+
+                    if (!ownedFinalTempFile.delete()) {
+                        throw IllegalStateException("Failed to delete avatar source staging file")
+                    }
+                    currentTempFile = null
+
+                    val avatarResult = JSObject().apply {
+                        put("path", avatarWorkFile.absolutePath)
+                        put("name", "avatar_work.webp")
+                        put("mime", "image/webp")
+                        put("size", avatarWorkFile.length())
+                        put("hash", avatarHash)
+                        put("thumbnailPath", org.json.JSONObject.NULL)
+                    }
+                    invoke.resolve(avatarResult)
+                    currentAvatarWorkFile = null
+                    return@fileTask
+                }
+
                 // 4. 图片资源触发 Native 硬件加速缩略图硬解
                 var thumbnailPath: String? = null
                 if (mimeType.startsWith("image/")) {
@@ -1821,22 +1923,24 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 Log.i(TAG, "[onPickFileResult] File copy & process complete: path=${ownedFinalTempFile.absolutePath}, hash=$hash")
                 
                 // 双轨通信：主动推送最终结果给前端，穿透 JNI 断裂层
-                val pickedDetail = JSObject().apply {
-                    put("path", ownedFinalTempFile.absolutePath)
-                    put("name", originalName)
-                    put("mime", mimeType)
-                    put("size", finalSize)
-                    put("hash", hash)
-                    if (thumbnailPath != null) {
-                        put("thumbnailPath", thumbnailPath)
-                    } else {
-                        put("thumbnailPath", org.json.JSONObject.NULL)
+                if (!isAvatarMode) {
+                    val pickedDetail = JSObject().apply {
+                        put("path", ownedFinalTempFile.absolutePath)
+                        put("name", originalName)
+                        put("mime", mimeType)
+                        put("size", finalSize)
+                        put("hash", hash)
+                        if (thumbnailPath != null) {
+                            put("thumbnailPath", thumbnailPath)
+                        } else {
+                            put("thumbnailPath", org.json.JSONObject.NULL)
+                        }
                     }
-                }
-                val safePickedDetail = escapeJsonForJsString(pickedDetail.toString())
-                val pickedScript = "window.dispatchEvent(new CustomEvent('vcp-mobile-file-picked', { detail: JSON.parse(\"$safePickedDetail\") }))"
-                activity.runOnUiThread {
-                    webViewRef?.evaluateJavascript(pickedScript, null)
+                    val safePickedDetail = escapeJsonForJsString(pickedDetail.toString())
+                    val pickedScript = "window.dispatchEvent(new CustomEvent('vcp-mobile-file-picked', { detail: JSON.parse(\"$safePickedDetail\") }))"
+                    activity.runOnUiThread {
+                        webViewRef?.evaluateJavascript(pickedScript, null)
+                    }
                 }
                 
                 invoke.resolve(resultObject)
@@ -1846,7 +1950,9 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                 Log.e(TAG, "[onPickFileResult] File pick handling failed", e)
                 try {
                     currentTempFile?.delete()
+                    currentTranscodeSourceFile?.delete()
                     currentThumbnailFile?.delete()
+                    currentAvatarWorkFile?.delete()
                 } catch (_: Exception) {}
                 invoke.reject("Handling picked file failed: ${e.message}")
             }
@@ -2083,6 +2189,10 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("Path is empty")
             return
         }
+        if (args.action != "view" && args.action != "share") {
+            invoke.reject("Unsupported native file action")
+            return
+        }
         
         executePluginTask(executorDomains.fileIoExecutor, invoke, "openFile", fileTask@{
             try {
@@ -2102,8 +2212,11 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
                 // 1. 自动提取并修正 MIME 类型
                 val ext = file.extension.lowercase()
-                val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
-                Log.i(TAG, "[openFile] Opening file: ${file.absolutePath} (ext=$ext, mime=$mimeType)")
+                val mimeType = when (ext) {
+                    "log", "txt" -> "text/plain"
+                    else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "*/*"
+                }
+                Log.i(TAG, "[openFile] Dispatching file action=${args.action}: ${file.absolutePath} (ext=$ext, mime=$mimeType)")
 
                 // 2. 借助 FileProvider 生成临时读取授权的 content:// URI
                 val uri = try {
@@ -2121,22 +2234,43 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                     )
                 }
 
-                // 3. 构建并分发默认的系统 ACTION_VIEW 意图
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, mimeType)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                // 3. 查看沿用 ACTION_VIEW；分享使用带临时 URI 权限的 ACTION_SEND。
+                val intent = if (args.action == "share") {
+                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = mimeType
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        putExtra(Intent.EXTRA_TITLE, file.name)
+                        clipData = ClipData.newRawUri(file.name, uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    Intent.createChooser(sendIntent, "分享文件").apply {
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                } else {
+                    Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, mimeType)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
                 }
 
                 context.startActivity(intent)
                 invoke.resolve()
             } catch (e: android.content.ActivityNotFoundException) {
                 val ext = java.io.File(path).extension.lowercase()
-                Log.e(TAG, "[openFile] No activity found to handle file type: .$ext", e)
-                invoke.reject("您的手机上未安装能打开此类文件 (.$ext) 的应用，请先安装相关阅读器 (如 WPS Office)。")
+                Log.e(TAG, "[openFile] No activity found for action=${args.action}, type=.$ext", e)
+                invoke.reject(if (args.action == "share") {
+                    "您的手机上未安装可接收此文件的应用"
+                } else {
+                    "您的手机上未安装能打开此类文件 (.$ext) 的应用，请先安装相关阅读器 (如 WPS Office)。"
+                })
             } catch (e: Throwable) {
-                Log.e(TAG, "[openFile] Native file viewing failed", e)
-                invoke.reject("打开文件失败: ${e.message}")
+                Log.e(TAG, "[openFile] Native file action=${args.action} failed", e)
+                invoke.reject(if (args.action == "share") {
+                    "分享文件失败: ${e.message}"
+                } else {
+                    "打开文件失败: ${e.message}"
+                })
             }
         })
     }
@@ -2900,6 +3034,7 @@ class RequestPermissionArgs {
 @InvokeArg
 class OpenFileArgs {
     lateinit var path: String
+    var action: String = "view"
 }
 
 @InvokeArg

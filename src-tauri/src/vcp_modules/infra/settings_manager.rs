@@ -17,6 +17,15 @@ fn default_sync_device_id() -> String {
     format!("mobile-{}", uuid::Uuid::new_v4().simple())
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ChatEndpointMode {
+    #[default]
+    Standard,
+    VcpTools,
+    Raw,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -36,6 +45,8 @@ pub struct Settings {
     // VCP 核心服务器
     #[serde(default)]
     pub vcp_server_url: String,
+    #[serde(default)]
+    pub chat_endpoint_mode: ChatEndpointMode,
     #[serde(default)]
     pub vcp_api_key: String,
     #[serde(default)]
@@ -171,6 +182,7 @@ pub fn create_default_settings() -> Settings {
         distributed_vcp_key: "".to_string(),
         distributed_device_name: "VCPMobile".to_string(),
         vcp_server_url: "".to_string(),
+        chat_endpoint_mode: ChatEndpointMode::Standard,
         vcp_api_key: "".to_string(),
         vcp_log_url: "".to_string(),
         vcp_log_key: "".to_string(),
@@ -191,6 +203,38 @@ pub fn create_default_settings() -> Settings {
         current_theme_mode: Some("dark".to_string()),
         extra: serde_json::Value::Object(serde_json::Map::new()),
     }
+}
+
+fn deserialize_persisted_settings(content: &str) -> Result<(Settings, bool), serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(content)?;
+    let Some(settings) = value.as_object_mut() else {
+        return serde_json::from_value(value).map(|settings| (settings, false));
+    };
+
+    let mut migrated = false;
+    if !settings.contains_key("chatEndpointMode") {
+        let endpoint_mode = match settings
+            .get("enableVcpToolInjection")
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(true) => ChatEndpointMode::VcpTools,
+            Some(false) => ChatEndpointMode::Standard,
+            // Mobile 旧版本始终请求 ChatVCP；缺少旧布尔字段时保持升级前行为。
+            None => ChatEndpointMode::VcpTools,
+        };
+        settings.insert(
+            "chatEndpointMode".to_string(),
+            serde_json::to_value(endpoint_mode)?,
+        );
+        migrated = true;
+    }
+
+    // 旧开关只用于一次性迁移；新枚举存在时由新枚举取得唯一所有权。
+    if settings.remove("enableVcpToolInjection").is_some() {
+        migrated = true;
+    }
+
+    serde_json::from_value(value).map(|settings| (settings, migrated))
 }
 
 #[tauri::command]
@@ -221,8 +265,22 @@ async fn read_settings_locked<R: Runtime>(
     let (mut settings, raw_content) = if let Some(row) = row_res {
         use sqlx::Row;
         let content: String = row.get("value");
-        let settings = match serde_json::from_str(&content) {
-            Ok(settings) => settings,
+        let settings = match deserialize_persisted_settings(&content) {
+            Ok((settings, migrated)) => {
+                if migrated {
+                    let migrated_content =
+                        serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+                    sqlx::query(
+                        "UPDATE settings SET value = ?, updated_at = ? WHERE key = 'global'",
+                    )
+                    .bind(migrated_content)
+                    .bind(crate::vcp_modules::infra::utils::now_millis())
+                    .execute(pool)
+                    .await
+                    .map_err(|e| format!("持久化设置迁移失败: {e}"))?;
+                }
+                settings
+            }
             Err(parse_error) => {
                 recover_corrupt_settings(pool, state, &content, &parse_error.to_string()).await?
             }
@@ -347,6 +405,7 @@ pub async fn update_settings<R: Runtime>(
             for (k, v) in obj {
                 current_obj.insert(k.clone(), v.clone());
             }
+            current_obj.remove("enableVcpToolInjection");
         }
     }
 
@@ -454,19 +513,61 @@ mod tests {
     use sqlx::Row;
 
     #[test]
-    fn legacy_settings_keep_unknown_flags_in_extra() {
-        let legacy: Settings = serde_json::from_value(json!({
-            "userName": "legacy-user",
-            "enableVcpToolInjection": true
-        }))
+    fn persisted_mobile_settings_without_route_keep_chatvcp_behavior() {
+        let (legacy, migrated) = deserialize_persisted_settings(
+            &json!({
+                "userName": "legacy-user"
+            })
+            .to_string(),
+        )
         .expect("deserialize legacy settings");
 
+        assert!(migrated);
+        assert_eq!(legacy.chat_endpoint_mode, ChatEndpointMode::VcpTools);
+    }
+
+    #[test]
+    fn legacy_tool_injection_flag_migrates_without_being_persisted() {
+        let (legacy, migrated) = deserialize_persisted_settings(
+            &json!({
+            "userName": "legacy-user",
+            "enableVcpToolInjection": true
+            })
+            .to_string(),
+        )
+        .expect("deserialize legacy settings");
+
+        assert!(migrated);
+        assert_eq!(legacy.chat_endpoint_mode, ChatEndpointMode::VcpTools);
+        let persisted = serde_json::to_value(legacy).expect("serialize migrated settings");
+        assert!(persisted.get("enableVcpToolInjection").is_none());
+        assert_eq!(persisted["chatEndpointMode"], "vcpTools");
+    }
+
+    #[test]
+    fn legacy_false_maps_to_standard_and_new_enum_has_priority() {
+        let (legacy_false, _) =
+            deserialize_persisted_settings(&json!({ "enableVcpToolInjection": false }).to_string())
+                .expect("deserialize legacy false");
+        assert_eq!(legacy_false.chat_endpoint_mode, ChatEndpointMode::Standard);
+
+        let (new_setting, migrated) = deserialize_persisted_settings(
+            &json!({
+                "chatEndpointMode": "raw",
+                "enableVcpToolInjection": true
+            })
+            .to_string(),
+        )
+        .expect("deserialize mixed settings");
+        assert!(migrated);
+        assert_eq!(new_setting.chat_endpoint_mode, ChatEndpointMode::Raw);
+    }
+
+    #[test]
+    fn fresh_install_defaults_to_standard_chat() {
         assert_eq!(
-            legacy
-                .extra
-                .get("enableVcpToolInjection")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
+            create_default_settings().chat_endpoint_mode,
+            ChatEndpointMode::Standard
         );
         assert!(
             legacy.sync_device_id.starts_with("mobile-"),

@@ -8,10 +8,12 @@ use crate::vcp_modules::group_context_assembler::assemble_group_context;
 use crate::vcp_modules::group_service::{read_group_config, GroupManagerState};
 use crate::vcp_modules::group_speaking_policy::determine_naturerandom_speakers;
 use crate::vcp_modules::message_service;
+use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
 use crate::vcp_modules::topic_types::{MessageKey, TopicKey};
 use crate::vcp_modules::vcp_client::{
-    message_transport_request_id, perform_vcp_request_registered, ActiveGroupTurns,
-    ActiveRequestLease, ActiveRequests, StreamEvent, VcpRequestPayload,
+    freeze_chat_connection, message_transport_request_id, perform_vcp_request_registered,
+    ActiveGroupTurns, ActiveRequestLease, ActiveRequests, ChatConnectionSnapshot,
+    ChatRequestPurpose, StreamEvent, VcpRequestPayload,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -24,16 +26,13 @@ pub struct GroupChatPayload {
     pub group_id: String,
     pub topic_id: String,
     pub user_message: ChatMessage,
-    pub vcp_url: String,
-    pub vcp_api_key: String,
 }
 
 pub struct GroupChatParams {
     pub group_id: String,
     pub topic_id: String,
     pub user_message: ChatMessage,
-    pub vcp_url: String,
-    pub vcp_api_key: String,
+    pub connection: ChatConnectionSnapshot,
     pub stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
 }
 
@@ -46,14 +45,13 @@ struct GroupSpeakerTurnParams<'a> {
     active_member_configs: &'a [crate::vcp_modules::agent_types::AgentConfig],
     group_id: &'a str,
     topic_id: &'a str,
-    vcp_url: &'a str,
-    vcp_api_key: &'a str,
+    connection: &'a ChatConnectionSnapshot,
     stream_channel: &'a Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
 }
 
 /// 执行群聊中单个发言者的完整回合：
 /// 组装上下文 → 模型路由 → 注册租约 → begin_stream_message → thinking 事件 →
-/// VCP 请求 → finalize 落盘与事件 / 失败时补发 error 终结事件。
+/// VCP 请求 → 由 durable finalizer 落盘并发送唯一终态事件。
 ///
 /// 返回生成的助手消息（`None` 表示该棒失败且已通知前端）。
 /// 结构化失败（`Err`）表示回合无法合法开始（DB/上下文装配错误等）。
@@ -69,8 +67,7 @@ async fn run_group_speaker_turn(
     let group_id = params.group_id;
     let topic_id = params.topic_id;
     let topic_key = TopicKey::new("group", group_id, topic_id);
-    let vcp_url = params.vcp_url;
-    let vcp_api_key = params.vcp_api_key;
+    let connection = params.connection;
     let stream_channel = params.stream_channel;
 
     let agent_id = speaker.id.clone();
@@ -136,8 +133,8 @@ async fn run_group_speaker_turn(
 
     let request_key = MessageKey::new(topic_key, message_id.clone());
     let request_payload = VcpRequestPayload {
-        vcp_url: vcp_url.to_string(),
-        vcp_api_key: vcp_api_key.to_string(),
+        vcp_url: connection.endpoint_url.clone(),
+        vcp_api_key: connection.api_key.clone(),
         messages: messages.clone(),
         model_config: model_config.clone(),
         message_id: message_id.clone(),
@@ -230,27 +227,20 @@ async fn run_group_speaker_turn(
             return Ok(Some(ai_msg));
         }
         Ok(None)
-    } else if let Err(e) = res_result {
+    } else if let Err(failure) = res_result {
         log::error!(
             "[GroupChatAppService] Error during agent {} response: {}",
             agent_id,
-            e
+            failure
         );
-        // 与 agent/assistant 路径对齐：接力失败必须给前端终结事件，
-        // 否则该 Agent 的 thinking 气泡永久悬挂，用户看到"无反应"
-        if let Some(chan) = stream_channel {
-            let _ = chan.send(StreamEvent::error(
-                message_id.clone(),
-                context.clone(),
-                e.clone(),
-            ));
-        }
-        crate::vcp_modules::vcp_client::finalize_stream_error(
+        let (error, partial_content) = failure.into_parts();
+        let _ = crate::vcp_modules::vcp_client::finalize_stream_error(
             app_handle,
             db_pool,
             &request_key,
-            None,
-            Some(e),
+            partial_content.unwrap_or_default(),
+            error,
+            stream_channel.clone(),
         )
         .await?;
         Ok(None)
@@ -274,8 +264,7 @@ pub async fn internal_process_group_chat_message(
     let group_id = params.group_id;
     let topic_id = params.topic_id;
     let user_message = params.user_message;
-    let vcp_url = params.vcp_url;
-    let vcp_api_key = params.vcp_api_key;
+    let connection = params.connection;
     let topic_key = TopicKey::new("group", &group_id, &topic_id);
     let group_turn = active_group_turns.try_acquire(topic_key.clone())?;
 
@@ -387,8 +376,7 @@ pub async fn internal_process_group_chat_message(
             active_member_configs: &active_member_configs,
             group_id: &group_id,
             topic_id: &topic_id,
-            vcp_url: &vcp_url,
-            vcp_api_key: &vcp_api_key,
+            connection: &connection,
             stream_channel: &stream_channel,
         };
 
@@ -427,6 +415,7 @@ pub async fn handle_group_chat_message(
     db_state: State<'_, DbState>,
     active_requests: State<'_, ActiveRequests>,
     active_group_turns: State<'_, ActiveGroupTurns>,
+    settings_state: State<'_, SettingsState>,
     payload: GroupChatPayload,
     stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
 ) -> Result<Value, String> {
@@ -434,6 +423,9 @@ pub async fn handle_group_chat_message(
         "[GroupChatAppService] handle_group_chat_message invoked for group: {}",
         payload.group_id
     );
+
+    let settings = read_settings(app_handle.clone(), settings_state).await?;
+    let connection = freeze_chat_connection(&settings, ChatRequestPurpose::Interactive)?;
 
     internal_process_group_chat_message(
         app_handle,
@@ -446,8 +438,7 @@ pub async fn handle_group_chat_message(
             group_id: payload.group_id,
             topic_id: payload.topic_id,
             user_message: payload.user_message,
-            vcp_url: payload.vcp_url,
-            vcp_api_key: payload.vcp_api_key,
+            connection,
             stream_channel: Some(stream_channel),
         },
         false, // append_user_msg
@@ -465,8 +456,6 @@ pub struct GroupInvitePayload {
     pub group_id: String,
     pub topic_id: String,
     pub agent_id: String,
-    pub vcp_url: String,
-    pub vcp_api_key: String,
 }
 
 /// 邀请指定群成员单人发言。
@@ -483,6 +472,7 @@ pub async fn invite_group_member_to_speak(
     db_state: State<'_, DbState>,
     active_requests: State<'_, ActiveRequests>,
     active_group_turns: State<'_, ActiveGroupTurns>,
+    settings_state: State<'_, SettingsState>,
     payload: GroupInvitePayload,
     stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
 ) -> Result<Value, String> {
@@ -494,6 +484,8 @@ pub async fn invite_group_member_to_speak(
     );
     let topic_key = TopicKey::new("group", &payload.group_id, &payload.topic_id);
     let _group_turn = active_group_turns.try_acquire(topic_key.clone())?;
+    let settings = read_settings(app_handle.clone(), settings_state).await?;
+    let connection = freeze_chat_connection(&settings, ChatRequestPurpose::Interactive)?;
 
     let group_config = read_group_config(
         app_handle.clone(),
@@ -545,8 +537,7 @@ pub async fn invite_group_member_to_speak(
         active_member_configs: &active_member_configs,
         group_id: &payload.group_id,
         topic_id: &payload.topic_id,
-        vcp_url: &payload.vcp_url,
-        vcp_api_key: &payload.vcp_api_key,
+        connection: &connection,
         stream_channel: &stream_channel,
     };
 

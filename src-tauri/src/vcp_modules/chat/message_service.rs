@@ -6,7 +6,8 @@ use crate::vcp_modules::message_repository::{
     serialize_render_async, write_render_cache_cas, MessageRepository, RENDERER_SCHEMA_VERSION,
 };
 use crate::vcp_modules::sync_hash::HashAggregator;
-use crate::vcp_modules::topic_types::{MessageKey, TopicKey};
+use crate::vcp_modules::topic_types::{MessageKey, TopicActivityDto, TopicKey};
+use serde::Serialize;
 use sqlx::Row;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
@@ -14,6 +15,13 @@ use tauri::{AppHandle, Manager};
 // =================================================================
 // vcp_modules/message_service.rs - 消息业务逻辑中心 (含附件对齐)
 // =================================================================
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageWriteResultDto {
+    pub blocks: Vec<ContentBlock>,
+    pub topic_updated_at: i64,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn load_chat_history_internal(
@@ -159,7 +167,7 @@ async fn convert_history_rows(
              ORDER BY ma.msg_id, ma.attachment_order ASC",
             extracted_text_column, placeholders
         );
-        let mut q = sqlx::query(&att_query)
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(att_query))
             .bind(&key.owner_type)
             .bind(&key.owner_id)
             .bind(&key.topic_id);
@@ -411,12 +419,12 @@ pub async fn load_chat_history_around_internal(
     let mut rows: Vec<sqlx::sqlite::SqliteRow> = Vec::new();
 
     // 前向窗口（早于锚点，含锚点本身）
-    let before_rows = sqlx::query(&format!(
+    let before_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{} WHERE m.owner_type = ? AND m.owner_id = ? AND m.topic_id = ? AND m.deleted_at IS NULL
            AND (m.timestamp < ? OR (m.timestamp = ? AND m.msg_id <= ?))
          ORDER BY m.timestamp DESC, m.msg_id DESC LIMIT ?",
         ROW_SELECT
-    ))
+    )))
     .bind(&key.owner_type)
     .bind(&key.owner_id)
     .bind(&key.topic_id)
@@ -431,12 +439,12 @@ pub async fn load_chat_history_around_internal(
 
     // 后向窗口（晚于锚点）
     if after_n > 0 {
-        let after_rows = sqlx::query(&format!(
+        let after_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "{} WHERE m.owner_type = ? AND m.owner_id = ? AND m.topic_id = ? AND m.deleted_at IS NULL
                AND (m.timestamp > ? OR (m.timestamp = ? AND m.msg_id > ?))
              ORDER BY m.timestamp ASC, m.msg_id ASC LIMIT ?",
             ROW_SELECT
-        ))
+        )))
         .bind(&key.owner_type)
         .bind(&key.owner_id)
         .bind(&key.topic_id)
@@ -539,7 +547,7 @@ pub async fn load_chat_text_history_for_context(
              ORDER BY ma.msg_id, ma.attachment_order ASC",
             extracted_text_column, placeholders
         );
-        let mut q = sqlx::query(&att_query)
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(att_query))
             .bind(&key.owner_type)
             .bind(&key.owner_id)
             .bind(&key.topic_id);
@@ -781,7 +789,7 @@ pub async fn append_single_message<R: tauri::Runtime>(
     owner_type: &str,
     topic_id: String,
     mut message: ChatMessage,
-) -> Result<Vec<ContentBlock>, String> {
+) -> Result<MessageWriteResultDto, String> {
     normalize_attachments_from_local_cas(&app_handle, db_pool, &mut message).await?;
 
     let (blocks, render_bytes): (Vec<ContentBlock>, Vec<u8>) =
@@ -796,7 +804,12 @@ pub async fn append_single_message<R: tauri::Runtime>(
 
     let key = TopicKey::new(owner_type, owner_id, &topic_id);
     let mut tx = db_pool.begin().await.map_err(|e| e.to_string())?;
-    MessageRepository::upsert_message(&mut tx, &message, &key, &render_bytes, false).await?;
+    let activity =
+        MessageRepository::upsert_message(&mut tx, &message, &key, &render_bytes, false).await?;
+    let activity = match activity {
+        Some(activity) => activity,
+        None => HashAggregator::load_topic_activity(&mut tx, &key).await?,
+    };
 
     tx.commit().await.map_err(|e| e.to_string())?;
     if message.role == "user" || !message.content.trim().is_empty() {
@@ -807,7 +820,10 @@ pub async fn append_single_message<R: tauri::Runtime>(
             message.id
         );
     }
-    Ok(blocks)
+    Ok(MessageWriteResultDto {
+        blocks,
+        topic_updated_at: activity.updated_at,
+    })
 }
 
 #[tauri::command]
@@ -898,7 +914,7 @@ pub async fn patch_single_message<R: tauri::Runtime>(
     topic_id: String,
     mut message: ChatMessage,
     skip_bubble: bool,
-) -> Result<Vec<ContentBlock>, String> {
+) -> Result<MessageWriteResultDto, String> {
     normalize_attachments_from_local_cas(&app_handle, db_pool, &mut message).await?;
 
     // 优先使用传入的 blocks，如果缺失则实时编译
@@ -914,11 +930,20 @@ pub async fn patch_single_message<R: tauri::Runtime>(
 
     let key = TopicKey::new(owner_type, owner_id, &topic_id);
     let mut tx = db_pool.begin().await.map_err(|e| e.to_string())?;
-    MessageRepository::upsert_message(&mut tx, &message, &key, &render_bytes, skip_bubble).await?;
+    let activity =
+        MessageRepository::upsert_message(&mut tx, &message, &key, &render_bytes, skip_bubble)
+            .await?;
+    let activity = match activity {
+        Some(activity) => activity,
+        None => HashAggregator::load_topic_activity(&mut tx, &key).await?,
+    };
 
     tx.commit().await.map_err(|e| e.to_string())?;
     crate::vcp_modules::sync_service::request_background_sync(&app_handle);
-    Ok(blocks)
+    Ok(MessageWriteResultDto {
+        blocks,
+        topic_updated_at: activity.updated_at,
+    })
 }
 
 pub struct MessageDeletionResult {
@@ -926,6 +951,7 @@ pub struct MessageDeletionResult {
     pub active_ids: Vec<String>,
     pub deleted_at: i64,
     pub msg_count: i32,
+    pub topic_updated_at: i64,
 }
 
 pub async fn delete_messages(
@@ -935,21 +961,15 @@ pub async fn delete_messages(
     deleted_at: Option<i64>,
 ) -> Result<MessageDeletionResult, String> {
     if msg_ids.is_empty() {
-        let msg_count: i32 = sqlx::query_scalar(
-            "SELECT msg_count FROM topics
-             WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND deleted_at IS NULL",
-        )
-        .bind(&key.owner_type)
-        .bind(&key.owner_id)
-        .bind(&key.topic_id)
-        .fetch_one(db_pool)
-        .await
-        .map_err(|e| e.to_string())?;
+        let mut tx = db_pool.begin().await.map_err(|e| e.to_string())?;
+        let activity = HashAggregator::load_topic_activity(&mut tx, key).await?;
+        tx.commit().await.map_err(|e| e.to_string())?;
         return Ok(MessageDeletionResult {
             deleted_ids: Vec::new(),
             active_ids: Vec::new(),
             deleted_at: deleted_at.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
-            msg_count,
+            msg_count: activity.msg_count,
+            topic_updated_at: activity.updated_at,
         });
     }
     if key.topic_id.is_empty()
@@ -970,7 +990,7 @@ pub async fn delete_messages(
          WHERE owner_type = ? AND owner_id = ? AND topic_id = ?
            AND deleted_at IS NULL AND msg_id IN ({placeholders})"
     );
-    let mut deleted_query = sqlx::query_scalar(&select_deleted_ids)
+    let mut deleted_query = sqlx::query_scalar(sqlx::AssertSqlSafe(select_deleted_ids))
         .bind(&key.owner_type)
         .bind(&key.owner_id)
         .bind(&key.topic_id);
@@ -987,7 +1007,7 @@ pub async fn delete_messages(
          WHERE owner_type = ? AND owner_id = ? AND topic_id = ?
            AND msg_id IN ({placeholders})"
     );
-    let mut active_query = sqlx::query_scalar(&select_active_ids)
+    let mut active_query = sqlx::query_scalar(sqlx::AssertSqlSafe(select_active_ids))
         .bind(&key.owner_type)
         .bind(&key.owner_id)
         .bind(&key.topic_id);
@@ -1005,7 +1025,7 @@ pub async fn delete_messages(
         msg_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
     );
     let now = deleted_at.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-    let mut q = sqlx::query(&delete_query)
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(delete_query))
         .bind(now)
         .bind(&key.owner_type)
         .bind(&key.owner_id)
@@ -1029,7 +1049,7 @@ pub async fn delete_messages(
          WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id IN ({})",
         msg_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
     );
-    let mut q_cache = sqlx::query(&delete_cache_query)
+    let mut q_cache = sqlx::query(sqlx::AssertSqlSafe(delete_cache_query))
         .bind(&key.owner_type)
         .bind(&key.owner_id)
         .bind(&key.topic_id);
@@ -1044,7 +1064,7 @@ pub async fn delete_messages(
          WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id IN ({})",
         msg_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
     );
-    let mut q_attachments = sqlx::query(&delete_attachments_query)
+    let mut q_attachments = sqlx::query(sqlx::AssertSqlSafe(delete_attachments_query))
         .bind(&key.owner_type)
         .bind(&key.owner_id)
         .bind(&key.topic_id);
@@ -1062,7 +1082,7 @@ pub async fn delete_messages(
          WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id IN ({})",
         msg_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
     );
-    let mut q_active = sqlx::query(&delete_active_gen_query)
+    let mut q_active = sqlx::query(sqlx::AssertSqlSafe(delete_active_gen_query))
         .bind(&key.owner_type)
         .bind(&key.owner_id)
         .bind(&key.topic_id);
@@ -1075,13 +1095,14 @@ pub async fn delete_messages(
         .map_err(|e| e.to_string())?;
 
     // FTS 由 after_messages_logical_delete 触发器在同一事务中清理。
-    let msg_count = HashAggregator::bubble_from_topic(&mut tx, key).await?;
+    let activity = HashAggregator::bubble_from_topic(&mut tx, key).await?;
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(MessageDeletionResult {
         deleted_ids,
         active_ids,
         deleted_at: now,
-        msg_count,
+        msg_count: activity.msg_count,
+        topic_updated_at: activity.updated_at,
     })
 }
 
@@ -1121,7 +1142,7 @@ pub(crate) async fn apply_sync_message_tombstones(
          WHERE owner_type = ? AND owner_id = ? AND topic_id = ?
            AND deleted_at IS NULL AND msg_id IN ({placeholders})"
     );
-    let mut live_query = sqlx::query_scalar(&live_sql)
+    let mut live_query = sqlx::query_scalar(sqlx::AssertSqlSafe(live_sql))
         .bind(&key.owner_type)
         .bind(&key.owner_id)
         .bind(&key.topic_id);
@@ -1143,7 +1164,7 @@ pub(crate) async fn apply_sync_message_tombstones(
            AND msg_id IN ({})",
         vec!["?"; deleted_ids.len()].join(", ")
     );
-    let mut active_query = sqlx::query_scalar(&active_sql)
+    let mut active_query = sqlx::query_scalar(sqlx::AssertSqlSafe(active_sql))
         .bind(&key.owner_type)
         .bind(&key.owner_id)
         .bind(&key.topic_id);
@@ -1173,7 +1194,7 @@ pub(crate) async fn apply_sync_message_tombstones(
          WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND deleted_at IS NULL
            AND msg_id IN (SELECT msg_id FROM incoming)"
     );
-    let mut update = sqlx::query(&update_sql);
+    let mut update = sqlx::query(sqlx::AssertSqlSafe(update_sql));
     for id in &deleted_ids {
         update = update.bind(id).bind(
             tombstone_times
@@ -1205,7 +1226,7 @@ pub(crate) async fn apply_sync_message_tombstones(
                AND msg_id IN ({})",
             vec!["?"; deleted_ids.len()].join(", ")
         );
-        let mut delete = sqlx::query(&delete_sql)
+        let mut delete = sqlx::query(sqlx::AssertSqlSafe(delete_sql))
             .bind(&key.owner_type)
             .bind(&key.owner_id)
             .bind(&key.topic_id);
@@ -1369,13 +1390,14 @@ pub async fn truncate_history_after_message(
         ));
     }
     // FTS 由 after_messages_logical_delete 触发器在同一事务中清理。
-    let msg_count = HashAggregator::bubble_from_topic(&mut tx, key).await?;
+    let activity = HashAggregator::bubble_from_topic(&mut tx, key).await?;
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(MessageDeletionResult {
         deleted_ids,
         active_ids,
         deleted_at: now,
-        msg_count,
+        msg_count: activity.msg_count,
+        topic_updated_at: activity.updated_at,
     })
 }
 
@@ -1487,42 +1509,48 @@ async fn finalize_stream_message_inner<R: tauri::Runtime>(
             "topicId": topic_id,
         }))
     };
-    let (end_blocks, end_timestamp) = if owner_id.is_empty() || topic_id.is_empty() {
-        (None, final_ts)
-    } else {
-        match commit_stream_message(
-            pool,
-            message_key,
-            &final_content,
-            final_ts,
-            &terminal_reason,
-            final_agent_id.as_deref(),
-            agent_name.as_deref(),
-        )
-        .await
-        {
-            Ok((blocks, start_timestamp)) => (Some(blocks), start_timestamp),
-            Err(error) => {
-                if let Some(chan) = &stream_channel {
-                    let event = crate::vcp_modules::vcp_client::StreamEvent::error(
-                        message_id.to_string(),
-                        context.clone(),
-                        format!("终态保存失败: {}", error),
-                    );
-                    let _ = chan.send(event);
+    let (end_blocks, end_timestamp, topic_updated_at) =
+        if owner_id.is_empty() || topic_id.is_empty() {
+            (None, final_ts, None)
+        } else {
+            match commit_stream_message(
+                pool,
+                message_key,
+                &final_content,
+                final_ts,
+                &terminal_reason,
+                final_agent_id.as_deref(),
+                agent_name.as_deref(),
+            )
+            .await
+            {
+                Ok((blocks, start_timestamp, updated_at)) => {
+                    (Some(blocks), start_timestamp, Some(updated_at))
                 }
-                return Err(error);
+                Err(error) => {
+                    if let Some(chan) = &stream_channel {
+                        let mut event = crate::vcp_modules::vcp_client::StreamEvent::error(
+                            message_id.to_string(),
+                            context.clone(),
+                            format!("终态保存失败: {}", error),
+                        );
+                        event.content = Some(final_content.clone());
+                        let _ = chan.send(event);
+                    }
+                    return Err(error);
+                }
             }
-        }
-    };
+        };
 
     if let Some(chan) = stream_channel {
         let event = crate::vcp_modules::vcp_client::StreamEvent::end(
             message_id.to_string(),
             context,
             Some(terminal_reason),
+            Some(final_content),
             end_blocks,
             Some(end_timestamp),
+            topic_updated_at,
         );
         let _ = chan.send(event);
     }
@@ -1540,7 +1568,7 @@ async fn commit_stream_message(
     finish_reason: &str,
     agent_id: Option<&str>,
     agent_name: Option<&str>,
-) -> Result<(Vec<ContentBlock>, u64), String> {
+) -> Result<(Vec<ContentBlock>, u64, i64), String> {
     let key = &message_key.topic;
     let owner_id = key.owner_id.as_str();
     let owner_type = key.owner_type.as_str();
@@ -1682,9 +1710,9 @@ async fn commit_stream_message(
         ));
     }
 
-    HashAggregator::bubble_from_topic(&mut tx, key).await?;
+    let activity = HashAggregator::bubble_from_topic(&mut tx, key).await?;
     tx.commit().await.map_err(|e| e.to_string())?;
-    Ok((blocks, start_timestamp as u64))
+    Ok((blocks, start_timestamp as u64, activity.updated_at))
 }
 
 #[tauri::command]
@@ -1696,7 +1724,7 @@ pub async fn delete_message_attachment(
     message_id: String,
     attachment_order: i32,
     hash: String,
-) -> Result<(), String> {
+) -> Result<TopicActivityDto, String> {
     use crate::vcp_modules::db_manager::DbState;
     use tauri::Manager;
     let db_state = app_handle.state::<DbState>();
@@ -1714,7 +1742,7 @@ async fn delete_message_attachment_in_pool(
     attachment_order: i32,
     hash: &str,
     now: i64,
-) -> Result<(), String> {
+) -> Result<TopicActivityDto, String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     let deleted = sqlx::query(
         "DELETE FROM message_attachments \
@@ -1731,8 +1759,9 @@ async fn delete_message_attachment_in_pool(
     .await
     .map_err(|e| e.to_string())?;
     if deleted.rows_affected() == 0 {
+        let activity = HashAggregator::load_topic_activity(&mut tx, key).await?;
         tx.commit().await.map_err(|e| e.to_string())?;
-        return Ok(());
+        return Ok(activity);
     }
 
     let (role, name, content, timestamp, agent_id, old_hash, old_updated_at): (
@@ -1804,9 +1833,9 @@ async fn delete_message_attachment_in_pool(
         return Err(format!("Message {message_id} is missing or deleted"));
     }
 
-    HashAggregator::bubble_from_topic(&mut tx, key).await?;
+    let activity = HashAggregator::bubble_from_topic(&mut tx, key).await?;
     tx.commit().await.map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(activity)
 }
 
 #[cfg(test)]
@@ -1972,7 +2001,7 @@ mod stream_lifecycle_tests {
         .await
         .expect("skeleton identity");
 
-        let (_, terminal_timestamp) = commit_stream_message(
+        let (_, terminal_timestamp, terminal_topic_updated_at) = commit_stream_message(
             &pool,
             &key,
             "terminal body",
@@ -1984,6 +2013,7 @@ mod stream_lifecycle_tests {
         .await
         .expect("finalize generation");
         assert_eq!(terminal_timestamp, skeleton.0 as u64);
+        assert_eq!(terminal_topic_updated_at, 2);
         let topic_updated_after_finalize: i64 =
             sqlx::query_scalar("SELECT updated_at FROM topics WHERE topic_id = 'topic-1'")
                 .fetch_one(&pool)

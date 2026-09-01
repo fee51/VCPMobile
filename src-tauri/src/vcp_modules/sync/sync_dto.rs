@@ -1,5 +1,5 @@
 use crate::vcp_modules::agent_types::AgentConfig;
-use crate::vcp_modules::group_types::GroupConfig;
+use crate::vcp_modules::group_types::{deserialize_member_tags, GroupConfig, MemberTags};
 use crate::vcp_modules::topic_types::Topic;
 use serde::{Deserialize, Serialize};
 
@@ -40,8 +40,12 @@ pub struct GroupSyncDTO {
     pub name: String,
     pub members: Vec<String>,
     pub mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub member_tags: Option<serde_json::Value>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_member_tags",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub member_tags: Option<MemberTags>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,12 +183,6 @@ pub struct MessageSyncDTO {
     pub attachments: Option<Vec<AttachmentSyncDTO>>,
     #[serde(rename = "contentHash", skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
-    #[serde(
-        rename = "avatarColor",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub avatar_color: Option<String>,
 }
 
 impl From<MessageSyncDTO> for crate::vcp_modules::chat_manager::ChatMessage {
@@ -249,6 +247,39 @@ mod tests {
     }
 
     #[test]
+    fn group_sync_dto_requires_string_member_tags_with_non_empty_keys() {
+        let valid: GroupSyncDTO = serde_json::from_value(json!({
+            "name": "Group",
+            "members": ["agent-1"],
+            "mode": "naturerandom",
+            "memberTags": { "agent-1": "猫娘, 科学", "历史成员": "" },
+            "useUnifiedModel": false,
+            "createdAt": 1
+        }))
+        .expect("string memberTags map");
+        assert_eq!(
+            valid
+                .member_tags
+                .as_ref()
+                .and_then(|tags| tags.get("agent-1"))
+                .map(String::as_str),
+            Some("猫娘, 科学")
+        );
+
+        for invalid_tags in [json!({ "agent-1": ["猫娘"] }), json!({ "": "猫娘" })] {
+            let result = serde_json::from_value::<GroupSyncDTO>(json!({
+                "name": "Group",
+                "members": ["agent-1"],
+                "mode": "naturerandom",
+                "memberTags": invalid_tags,
+                "useUnifiedModel": false,
+                "createdAt": 1
+            }));
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
     fn test_message_sync_dto_into_chat_message_maps_attachments_and_defaults_local_paths() {
         let dto = MessageSyncDTO {
             id: "msg-1".to_string(),
@@ -273,7 +304,6 @@ mod tests {
                 created_at: Some(200),
             }]),
             content_hash: Some("content-hash".to_string()),
-            avatar_color: Some("#fff".to_string()),
         };
 
         let msg = ChatMessage::from(dto);

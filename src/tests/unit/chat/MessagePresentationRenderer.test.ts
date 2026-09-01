@@ -1,16 +1,78 @@
-import { defineComponent, nextTick, ref } from 'vue';
+import { defineComponent, nextTick, reactive, ref } from 'vue';
 import { mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import MessageRenderer from '@/features/chat/MessageRenderer.vue';
 import type { ChatMessage } from '@/core/types/chat';
+import { useChatSessionStore } from '@/core/stores/chatSessionStore';
+import { useChatStreamStore } from '@/core/stores/chatStreamStore';
 import type { ChatPresentationMode } from '@/core/stores/theme';
+import { invokeMock, mockInvoke } from '@/tests/mocks/tauri';
+
+const { mermaidRenderMock } = vi.hoisted(() => ({
+  mermaidRenderMock: vi.fn(async () => ({ svg: '<svg viewBox="0 0 10 10"></svg>' })),
+}));
+
+vi.mock('mermaid', () => ({
+  default: {
+    initialize: vi.fn(),
+    render: mermaidRenderMock,
+  },
+}));
 
 const markerStub = (marker: string) => defineComponent({
   template: `<div data-strong-block="${marker}">${marker}</div>`,
 });
 
 describe('MessageRenderer presentation shell', () => {
+  it('enhances an already-rendered first-pass Mermaid SVG immediately', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const message: ChatMessage = {
+      id: 'existing-mermaid-svg',
+      role: 'assistant',
+      timestamp: 1,
+      agentId: 'agent-a',
+      shell: {
+        avatarColor: '#64748b',
+        displayName: 'Agent A',
+        isUser: false,
+      },
+      blocks: [{
+        type: 'markdown',
+        hash: 'existing-mermaid-svg',
+        nodes: [{
+          type: 'raw_html',
+          content: '<div class="mermaid" data-mermaid-source="graph TD;A--&gt;B"><svg viewBox="0 0 10 10"><text>A</text></svg></div>',
+        }],
+      }],
+    };
+    const MermaidViewerStub = defineComponent({
+      props: { visible: Boolean },
+      template: '<div data-mermaid-viewer :data-visible="String(visible)" />',
+    });
+
+    const wrapper = mount(MessageRenderer, {
+      props: { message },
+      global: {
+        plugins: [pinia],
+        directives: { longpress: {} },
+        stubs: {
+          VcpAvatar: markerStub('avatar'),
+          MermaidFullScreenViewer: MermaidViewerStub,
+        },
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(wrapper.find('.vcp-mermaid-wrapper').exists()).toBe(true);
+    });
+    await wrapper.get('.vcp-mermaid-wrapper').trigger('click');
+    expect(wrapper.get('[data-mermaid-viewer]').attributes('data-visible')).toBe('true');
+    expect(mermaidRenderMock).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
   it('keeps the same multi-bubble and strong-content tree across all three modes', async () => {
     const pinia = createPinia();
     setActivePinia(pinia);
@@ -110,6 +172,363 @@ describe('MessageRenderer presentation shell', () => {
     await nextTick();
     assertStableFixture('immersive');
 
+    wrapper.unmount();
+  });
+
+  it('lets a new Aurora stream reset a lower frame sequence from the previous stream', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const sessionStore = useChatSessionStore();
+    const streamStore = useChatStreamStore();
+    sessionStore.setConversation({
+      id: 'agent-a',
+      type: 'agent',
+      name: 'Agent A',
+    } as any, 'topic-a');
+    streamStore.addSessionStream('agent-a', 'agent', 'topic-a', 'stream-message');
+
+    const oldNodes = [{
+      type: 'paragraph' as const,
+      children: [{ type: 'text' as const, value: 'old tail' }],
+    }];
+    const message = reactive<ChatMessage>({
+      id: 'stream-message',
+      role: 'assistant',
+      timestamp: 1,
+      agentId: 'agent-a',
+      shell: {
+        avatarColor: '#64748b',
+        displayName: 'Agent A',
+        isUser: false,
+      },
+      blocks: [],
+      tailContent: 'old tail',
+      tailBlock: {
+        type: 'markdown',
+        content: 'old tail',
+        nodes: oldNodes,
+        hash: 'old',
+      },
+      tailSnapshot: oldNodes,
+      tailFrame: {
+        streamId: 1,
+        epoch: 1,
+        revision: 100,
+        frameSeq: 100,
+        reset: true,
+        snapshot: oldNodes,
+        mutations: [],
+      },
+    });
+
+    const wrapper = mount(MessageRenderer, {
+      props: { message },
+      global: {
+        plugins: [pinia],
+        directives: { longpress: {} },
+        stubs: {
+          VcpAvatar: markerStub('avatar'),
+          ToolBlock: markerStub('tool'),
+          ThoughtBlock: markerStub('thought'),
+          HtmlPreviewBlock: markerStub('html-preview'),
+          ToolSummaryBlock: markerStub('tool-summary'),
+          DiaryBlock: markerStub('diary'),
+          AttachmentPreview: markerStub('attachment'),
+          MermaidFullScreenViewer: markerStub('mermaid-viewer'),
+          ThinkingIndicator: markerStub('thinking'),
+          StreamingTag: markerStub('streaming'),
+        },
+      },
+    });
+    await nextTick();
+    await nextTick();
+    expect(wrapper.get('.vcp-ast-sandbox').text()).toContain('old tail');
+
+    const newNodes = [{
+      type: 'paragraph' as const,
+      children: [{ type: 'text' as const, value: 'new tail' }],
+    }];
+    message.tailContent = 'new tail';
+    message.tailBlock = {
+      type: 'markdown',
+      content: 'new tail',
+      nodes: newNodes,
+      hash: 'new',
+    };
+    message.tailSnapshot = newNodes;
+    message.tailFrame = {
+      streamId: 2,
+      epoch: 1,
+      revision: 1,
+      frameSeq: 1,
+      mutations: [],
+    };
+    await nextTick();
+    await nextTick();
+
+    expect(wrapper.get('.vcp-ast-sandbox').text()).toContain('new tail');
+    wrapper.unmount();
+  });
+
+  it('applies mutations that were coalesced behind a reset snapshot', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const sessionStore = useChatSessionStore();
+    const streamStore = useChatStreamStore();
+    sessionStore.setConversation({
+      id: 'agent-a',
+      type: 'agent',
+      name: 'Agent A',
+    } as any, 'topic-a');
+    streamStore.addSessionStream('agent-a', 'agent', 'topic-a', 'reset-batch');
+
+    const message = reactive<ChatMessage>({
+      id: 'reset-batch',
+      role: 'assistant',
+      timestamp: 1,
+      agentId: 'agent-a',
+      shell: {
+        avatarColor: '#64748b',
+        displayName: 'Agent A',
+        isUser: false,
+      },
+      blocks: [],
+      tailContent: 'base!',
+      tailBlock: {
+        type: 'markdown',
+        content: 'base!',
+        hash: 'base-next',
+        render_mode: 'ast',
+      },
+      tailFrame: {
+        streamId: 3,
+        epoch: 1,
+        revision: 2,
+        frameSeq: 2,
+        reset: true,
+        snapshot: [{
+          type: 'paragraph',
+          children: [{ type: 'text', value: 'base' }],
+        }],
+        mutations: [{ op: 'append', id: 't0.i0', chunk: '!' }],
+      },
+    });
+
+    const wrapper = mount(MessageRenderer, {
+      props: { message },
+      global: {
+        plugins: [pinia],
+        directives: { longpress: {} },
+        stubs: {
+          VcpAvatar: markerStub('avatar'),
+          ToolBlock: markerStub('tool'),
+          ThoughtBlock: markerStub('thought'),
+          HtmlPreviewBlock: markerStub('html-preview'),
+          ToolSummaryBlock: markerStub('tool-summary'),
+          DiaryBlock: markerStub('diary'),
+          AttachmentPreview: markerStub('attachment'),
+          MermaidFullScreenViewer: markerStub('mermaid-viewer'),
+          ThinkingIndicator: markerStub('thinking'),
+          StreamingTag: markerStub('streaming'),
+        },
+      },
+    });
+    await nextTick();
+    await nextTick();
+    expect(wrapper.get('.vcp-ast-sandbox').text()).toContain('base!');
+    wrapper.unmount();
+  });
+
+  it('requests one canonical snapshot when an AST tail remounts after earlier deltas', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const sessionStore = useChatSessionStore();
+    const streamStore = useChatStreamStore();
+    sessionStore.setConversation({
+      id: 'agent-a',
+      type: 'agent',
+      name: 'Agent A',
+    } as any, 'topic-a');
+
+    const context = {
+      ownerId: 'agent-a',
+      ownerType: 'agent' as const,
+      topicId: 'topic-a',
+      agentId: 'agent-a',
+    };
+    const eventBase = {
+      chunk: null,
+      finishReason: null,
+      error: null,
+      blocks: null,
+      timestamp: null,
+      topicUpdatedAt: null,
+    };
+    await streamStore.processStreamEvent({
+      ...eventBase,
+      type: 'thinking',
+      messageId: 'remount-message',
+      context,
+      aurora: null,
+    });
+
+    let fullContent = '';
+    for (let frameSeq = 1; frameSeq <= 5; frameSeq += 1) {
+      const chunk = String.fromCharCode(96 + frameSeq);
+      fullContent += chunk;
+      await streamStore.processStreamEvent({
+        ...eventBase,
+        type: 'aurora',
+        messageId: 'remount-message',
+        context,
+        aurora: {
+          kind: 'delta',
+          streamId: 9,
+          chunk,
+          tailOp: {
+            op: 'replace',
+            content: fullContent,
+            hash: `tail-${frameSeq}`,
+            mode: 'ast',
+          },
+          tailFrame: {
+            streamId: 9,
+            epoch: 1,
+            revision: frameSeq,
+            frameSeq,
+            mutations: frameSeq === 1
+              ? [{
+                  op: 'add',
+                  id: 't0',
+                  parent: 'root',
+                  node: {
+                    type: 'paragraph',
+                    children: [{ type: 'text', value: chunk }],
+                  },
+                }]
+              : [{ op: 'append', id: 't0.i0', chunk }],
+          },
+        },
+      });
+    }
+
+    await vi.waitFor(() => {
+      expect(streamStore.getActiveStreamMessage(
+        'agent-a',
+        'agent',
+        'topic-a',
+        'remount-message',
+      )?.tailFrame?.frameSeq).toBe(5);
+    });
+    mockInvoke('rebuild_aurora_snapshot', (args) => {
+      const content = String(args?.content ?? '');
+      return {
+        stableBlocks: [],
+        tailBlock: { type: 'markdown', content, hash: 'snapshot' },
+        tailMode: 'ast',
+        tailSnapshot: [{
+          type: 'paragraph',
+          children: [{ type: 'text', value: content }],
+        }],
+      };
+    });
+
+    const message = streamStore.getActiveStreamMessage(
+      'agent-a',
+      'agent',
+      'topic-a',
+      'remount-message',
+    )!;
+    const wrapper = mount(MessageRenderer, {
+      props: { message },
+      global: {
+        plugins: [pinia],
+        directives: { longpress: {} },
+        stubs: {
+          VcpAvatar: markerStub('avatar'),
+          ToolBlock: markerStub('tool'),
+          ThoughtBlock: markerStub('thought'),
+          HtmlPreviewBlock: markerStub('html-preview'),
+          ToolSummaryBlock: markerStub('tool-summary'),
+          DiaryBlock: markerStub('diary'),
+          AttachmentPreview: markerStub('attachment'),
+          MermaidFullScreenViewer: markerStub('mermaid-viewer'),
+          ThinkingIndicator: markerStub('thinking'),
+          StreamingTag: markerStub('streaming'),
+        },
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith(
+        'rebuild_aurora_snapshot',
+        { content: 'abcde' },
+      );
+      expect(wrapper.get('.vcp-ast-sandbox').text()).toContain('abcde');
+    });
+    expect(invokeMock.mock.calls.filter(
+      ([command]) => command === 'rebuild_aurora_snapshot',
+    )).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it('renders an AST-less streaming tail as literal plaintext', async () => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const sessionStore = useChatSessionStore();
+    const streamStore = useChatStreamStore();
+    sessionStore.setConversation({
+      id: 'agent-a',
+      type: 'agent',
+      name: 'Agent A',
+    } as any, 'topic-a');
+    streamStore.addSessionStream('agent-a', 'agent', 'topic-a', 'plain-tail-message');
+
+    const literalTail = '<div>unfinished\n<script>alert("x")</script>';
+    const message = reactive<ChatMessage>({
+      id: 'plain-tail-message',
+      role: 'assistant',
+      timestamp: 1,
+      agentId: 'agent-a',
+      shell: {
+        avatarColor: '#64748b',
+        displayName: 'Agent A',
+        isUser: false,
+      },
+      blocks: [],
+      tailContent: literalTail,
+      tailBlock: {
+        type: 'markdown',
+        content: literalTail,
+        hash: 'plain-tail',
+      },
+    });
+
+    const wrapper = mount(MessageRenderer, {
+      props: { message },
+      global: {
+        plugins: [pinia],
+        directives: { longpress: {} },
+        stubs: {
+          VcpAvatar: markerStub('avatar'),
+          ToolBlock: markerStub('tool'),
+          ThoughtBlock: markerStub('thought'),
+          HtmlPreviewBlock: markerStub('html-preview'),
+          ToolSummaryBlock: markerStub('tool-summary'),
+          DiaryBlock: markerStub('diary'),
+          AttachmentPreview: markerStub('attachment'),
+          MermaidFullScreenViewer: markerStub('mermaid-viewer'),
+          ThinkingIndicator: markerStub('thinking'),
+          StreamingTag: markerStub('streaming'),
+        },
+      },
+    });
+    await nextTick();
+
+    const plaintext = wrapper.get('[data-tail-render-mode="plaintext"]');
+    expect(plaintext.text()).toBe(literalTail);
+    expect(plaintext.find('script').exists()).toBe(false);
+    expect(wrapper.find('.vcp-ast-sandbox').exists()).toBe(false);
     wrapper.unmount();
   });
 });

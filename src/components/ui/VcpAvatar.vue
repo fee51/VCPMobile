@@ -23,6 +23,18 @@ const props = defineProps<{
 const avatarStore = useAvatarStore();
 const avatarUrl = ref("");
 const imgExists = ref(false);
+const isNearViewport = ref(false);
+
+const handleIntersect = () => {
+  isNearViewport.value = true;
+};
+
+const handleUnintersect = () => {
+  isNearViewport.value = false;
+  // 离开预加载区后卸载图片元素，释放 WebView 解码位图；压缩 Blob 仍由 Store LRU 管理。
+  avatarUrl.value = "";
+  imgExists.value = false;
+};
 
 // 解析属性值，优先从 target 中提取
 const resolvedType = computed(() => props.target?.type || props.ownerType || "agent");
@@ -78,22 +90,22 @@ watchEffect(async (onCleanup) => {
     imgExists.value = false;
     return;
   }
+  if (!isNearViewport.value) return;
   
-  const key = `${ownerTypeVal}:${ownerIdVal}`;
   const reqVersion = props.version || 0;
 
-  // 核心修复：同步检查缓存。如果命中且不需要强制刷新，立即显示，消除“顿一下”的感觉。
-  const existing = avatarStore.cache.get(key);
-  if (existing && (reqVersion === 0 || existing.version >= reqVersion)) {
+  const existing = avatarStore.getCachedAvatar(ownerTypeVal, ownerIdVal, reqVersion);
+  if (existing) {
     avatarUrl.value = existing.blobUrl;
     imgExists.value = true;
     return;
   }
 
-  // 缓存未命中或版本过旧，再进入异步获取逻辑
+  imgExists.value = false;
   const url = await avatarStore.getAvatarUrl(ownerTypeVal, ownerIdVal, reqVersion);
   if (
     cancelled ||
+    !isNearViewport.value ||
     resolvedId.value !== ownerIdVal ||
     resolvedType.value !== ownerTypeVal
   ) return;
@@ -116,7 +128,10 @@ const handleImgError = () => {
     rounded || 'rounded-xl',
     'relative overflow-hidden flex-shrink-0 flex items-center justify-center shadow-inner transition-all duration-500',
     resolvedColor ? 'border' : 'border border-black/15 dark:border-white/20'
-  ]" :style="borderStyle">
+  ]" :style="borderStyle"
+    v-intersection-observer="{ rootMargin: '300px 0px', threshold: 0.01 }"
+    @intersect="handleIntersect"
+    @unintersect="handleUnintersect">
     <!-- Fallback 占位 (底层) -->
     <div 
       class="absolute inset-0 flex items-center justify-center text-white font-bold select-none"
@@ -130,6 +145,7 @@ const handleImgError = () => {
     <img 
       v-if="imgExists && avatarUrl" 
       :src="avatarUrl" 
+      draggable="false"
       @error="handleImgError" 
       class="relative w-full h-full object-cover transition-opacity duration-300"
     />
