@@ -39,6 +39,7 @@ const SYNC_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(270);
 const PHASE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const FINAL_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SYNC_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_SYNC_RETRIES: u32 = 3;
 const MAX_SYNC_TOPICS: usize = 10_000;
 #[cfg(target_os = "android")]
 const SYNC_GUARDIAN_LABEL: &str = "[数据同步] VCP Mobile";
