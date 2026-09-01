@@ -1,7 +1,7 @@
 ---
 title: APK 更新体系
 id: module-08
-version: "1.1.6"
+version: "1.1.7"
 description: Rust 状态机驱动的 GitHub Release 检查、断点续传下载、SHA-256 与签名校验、Android 系统安装
 tags: [ota, update, apk, semver, sha256, state-machine]
 related_modules:

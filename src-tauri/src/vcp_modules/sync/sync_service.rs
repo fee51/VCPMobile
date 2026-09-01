@@ -918,6 +918,7 @@ pub enum SyncCommand {
         target: DeleteTarget,
         deleted_at: i64,
     },
+    StartManualSync,
     SendMessageDiff {
         attempt_id: u64,
         topics: Vec<MessageDiffTopicState>,
