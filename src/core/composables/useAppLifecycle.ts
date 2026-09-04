@@ -3,12 +3,16 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAppLifecycleStore } from '../stores/appLifecycle';
 import { useChatStreamStore } from '../stores/chatStreamStore';
+import { useDataReload } from './useDataReload';
 
 export function useAppLifecycle() {
   const lifecycleStore = useAppLifecycleStore();
   const streamStore = useChatStreamStore();
+  const { performFullReload } = useDataReload();
   let unlisten: UnlistenFn | null = null;
+  let unlistenSyncCompleted: UnlistenFn | null = null;
   let recoveryPromise: Promise<void> | null = null;
+  let reloadPromise: Promise<void> | null = null;
 
   const reconcileInterruptedStreams = (source: string) => {
     if (lifecycleStore.state !== 'READY' || lifecycleStore.isBackground) return;
@@ -68,6 +72,20 @@ export function useAppLifecycle() {
     }
 
     try {
+      unlistenSyncCompleted = await listen<{ status?: string }>("vcp-sync-completed", (event) => {
+        const status = event.payload?.status;
+        if (status !== "completed" && status !== "completed_with_warnings") return;
+        if (lifecycleStore.state !== "READY" || lifecycleStore.isBackground) return;
+        if (reloadPromise) return;
+        reloadPromise = performFullReload()
+          .catch((err) => {
+            console.error("[useAppLifecycle] Failed to reload after sync:", err);
+          })
+          .finally(() => {
+            reloadPromise = null;
+          });
+      });
+
       unlisten = await listen<{ state: string }>("vcp-lifecycle-changed", (event) => {
         const state = event.payload.state;
         console.log(`[useAppLifecycle] Received vcp-lifecycle-changed: state=${state}`);
@@ -95,6 +113,9 @@ export function useAppLifecycle() {
     }
     if (unlisten) {
       unlisten();
+    }
+    if (unlistenSyncCompleted) {
+      unlistenSyncCompleted();
     }
   });
 }

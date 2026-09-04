@@ -47,23 +47,28 @@ const rebuildEmoticonLibrary = async () => {
 
 <template>
   <div class="space-y-5 px-1">
+    <p class="text-xs leading-5 opacity-60 px-0.5">
+      办公室电脑和手机不在同一网络时，填写云端 SyncHub 地址，令牌与电脑
+      <span class="font-mono">AppData/cloud-sync.json</span>
+      相同。同一 WiFi 下也可继续填电脑局域网 5974/5975。
+    </p>
     <SettingsTextField
       v-model="settings.syncHttpUrl"
       label="HTTP 服务 URL"
-      placeholder="http://192.168.x.x:5974"
+      placeholder="https://hub-vcp.0012138.xyz/hub 或 http://192.168.x.x:5974"
       mono
     />
     <SettingsTextField
       v-model="settings.syncServerUrl"
       label="WebSocket 服务 URL"
-      placeholder="ws://192.168.x.x:5975"
+      placeholder="wss://hub-vcp.0012138.xyz/hub-ws 或 ws://192.168.x.x:5975"
       mono
     />
     <SettingsTextField
       v-model="settings.syncToken"
       is-secure
       label="Mobile Sync Token"
-      placeholder="输入桌面端 config.env 中的 Token"
+      placeholder="与电脑 AppData/cloud-sync.json 的 syncToken 一致"
       mono
     />
     <SettingsTextField

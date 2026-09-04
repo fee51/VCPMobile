@@ -3,6 +3,7 @@ pub mod sync_error;
 pub mod sync_executor;
 pub mod sync_finalize;
 pub mod sync_hash;
+pub mod sync_hub;
 pub mod sync_logger;
 pub mod sync_pipeline;
 pub mod sync_service;

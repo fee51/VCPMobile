@@ -732,6 +732,15 @@ async fn process_topic_messages(
     Ok(parsed_count)
 }
 
+pub(crate) async fn apply_pulled_topic_messages(
+    key: &TopicKey,
+    parsed_messages: Vec<crate::vcp_modules::chat_manager::ChatMessage>,
+    write_queue: &DbWriteQueue,
+    prerender_enabled: bool,
+) -> Result<usize, String> {
+    process_topic_messages(key, parsed_messages, write_queue, prerender_enabled).await
+}
+
 /// 批量 Pull 单 topic 处理结果
 pub struct BatchPullResult {
     pub topic: TopicKey,

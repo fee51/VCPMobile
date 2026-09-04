@@ -15,7 +15,7 @@ use crate::vcp_modules::sync_types::{
 use crate::vcp_modules::topic_types::{OwnerKey, TopicKey};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::future::Future;
 use std::io::Write;
@@ -1238,6 +1238,313 @@ fn build_sync_session_config(
     })
 }
 
+async fn pull_sync_hub_snapshot(
+    app_handle: &AppHandle,
+    session_id: u64,
+    http_client: &reqwest::Client,
+    http_url: &str,
+    sync_token: &str,
+    write_queue: &DbWriteQueue,
+    prerender_enabled: bool,
+    connection_status: &Arc<RwLock<String>>,
+    last_cursor: &mut Option<u64>,
+) -> Result<(), String> {
+    emit_sync_log(app_handle, "info", "正在从云端 SyncHub 拉取快照...");
+    let summary = crate::vcp_modules::sync::sync_hub::pull_and_apply(
+        http_client,
+        http_url,
+        sync_token,
+        write_queue,
+        prerender_enabled,
+    )
+    .await?;
+    if last_cursor.is_some_and(|cursor| cursor == summary.cursor) {
+        emit_sync_log(
+            app_handle,
+            "info",
+            &format!("SyncHub 快照无新变更 (cursor={})", summary.cursor),
+        );
+        return Ok(());
+    }
+    crate::vcp_modules::sync::sync_finalize::invalidate_sync_entity_caches(app_handle);
+    let completion = SyncCompletionSummary {
+        successful_topics: summary.topics,
+        total_topics: summary.topics,
+        failed_topics: 0,
+        legacy_attachment_warnings: 0,
+        failed_topic_ids: Vec::new(),
+    };
+    if last_cursor.is_none() {
+        let _ = publish_sync_completed(
+            app_handle,
+            session_id,
+            connection_status,
+            completion.clone(),
+        )
+        .await;
+    } else {
+        let _ = app_handle.emit(
+            "vcp-sync-completed",
+            json!({
+                "source": "Sync",
+                "sessionId": session_id,
+                "status": "completed",
+                "summary": completion,
+            }),
+        );
+    }
+    emit_sync_log(
+        app_handle,
+        "success",
+        &format!(
+            "SyncHub 同步完成: agents={}, topics={}, messages={}, cursor={}",
+            summary.agents, summary.topics, summary.messages, summary.cursor
+        ),
+    );
+    *last_cursor = Some(summary.cursor);
+    Ok(())
+}
+
+async fn run_sync_hub_session(
+    app_handle: &AppHandle,
+    session_id: u64,
+    http_client: &reqwest::Client,
+    http_url: &str,
+    ws_url: &str,
+    sync_token: &str,
+    device_id: &str,
+    write_queue: &DbWriteQueue,
+    prerender_enabled: bool,
+    cancel_token: &CancellationToken,
+    rx: &mut mpsc::UnboundedReceiver<SyncCommand>,
+    connection_status: &Arc<RwLock<String>>,
+) -> Result<(), String> {
+    emit_sync_log(
+        app_handle,
+        "info",
+        "检测到云端 SyncHub，改用快照同步（电脑/手机共用消息中心）",
+    );
+    publish_sync_nonterminal_status(app_handle, session_id, connection_status, "connecting").await;
+
+    let mut last_cursor = None;
+    let mut last_push_watermark: Option<i64> = None;
+    if let Err(error) = pull_sync_hub_snapshot(
+        app_handle,
+        session_id,
+        http_client,
+        http_url,
+        sync_token,
+        write_queue,
+        prerender_enabled,
+        connection_status,
+        &mut last_cursor,
+    )
+    .await
+    {
+        publish_sync_error(
+            app_handle,
+            session_id,
+            connection_status,
+            "SYNC_HUB_PULL_FAILED",
+            &error,
+            Vec::new(),
+        )
+        .await;
+        return Err(error);
+    }
+
+    publish_sync_nonterminal_status(app_handle, session_id, connection_status, "open").await;
+
+    let mut retry_delay = Duration::from_secs(3);
+    loop {
+        if cancel_token.is_cancelled() {
+            return Ok(());
+        }
+
+        let connect_result = tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => return Ok(()),
+            result = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(ws_url)) => result,
+        };
+
+        let mut ws_stream = match connect_result {
+            Ok(Ok((ws_stream, _))) => ws_stream,
+            Ok(Err(error)) => {
+                emit_sync_log(
+                    app_handle,
+                    "warning",
+                    &format!("SyncHub WebSocket 连接失败: {error}；将继续轮询快照"),
+                );
+                if cancelled_during(cancel_token, retry_delay).await {
+                    return Ok(());
+                }
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+                if let Err(error) = pull_sync_hub_snapshot(
+                    app_handle,
+                    session_id,
+                    http_client,
+                    http_url,
+                    sync_token,
+                    write_queue,
+                    prerender_enabled,
+                    connection_status,
+                    &mut last_cursor,
+                )
+                .await
+                {
+                    emit_sync_log(app_handle, "warning", &format!("SyncHub 轮询失败: {error}"));
+                }
+                continue;
+            }
+            Err(_) => {
+                emit_sync_log(app_handle, "warning", "SyncHub WebSocket 连接超时；将继续轮询快照");
+                if cancelled_during(cancel_token, retry_delay).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+
+        let version_req = VersionCheckFrame {
+            frame_type: "VERSION_CHECK",
+            mobile_version: env!("CARGO_PKG_VERSION"),
+            protocol_version: WIRE_PROTOCOL_VERSION,
+        };
+        let _ = send_ws_frame(&mut ws_stream, &version_req).await;
+        emit_sync_log(app_handle, "success", "已连接 SyncHub，等待其他设备更新");
+        retry_delay = Duration::from_secs(3);
+        let mut poll = tokio::time::interval(Duration::from_secs(30));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        poll.tick().await;
+        let mut pending_pull = false;
+        let mut pending_push = false;
+
+        loop {
+            if pending_push {
+                pending_push = false;
+                let now = chrono::Utc::now().timestamp_millis();
+                let since = last_push_watermark.unwrap_or_else(|| now - 24 * 60 * 60 * 1000);
+                let db = app_handle.state::<DbState>();
+                match crate::vcp_modules::sync::sync_hub::push_local_changes(
+                    http_client,
+                    http_url,
+                    sync_token,
+                    &db.pool,
+                    since,
+                )
+                .await
+                {
+                    Ok(summary) => {
+                        last_push_watermark = Some(now.saturating_sub(60_000));
+                        emit_sync_log(
+                            app_handle,
+                            "success",
+                            &format!(
+                                "已上传到 SyncHub: entities={}, topics={}, messages={}, deleted={}",
+                                summary.entities,
+                                summary.topics,
+                                summary.messages,
+                                summary.deleted_messages
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        emit_sync_log(app_handle, "warning", &format!("SyncHub 上传失败: {error}"));
+                    }
+                }
+                pending_pull = true;
+            }
+            if pending_pull {
+                pending_pull = false;
+                if let Err(error) = pull_sync_hub_snapshot(
+                    app_handle,
+                    session_id,
+                    http_client,
+                    http_url,
+                    sync_token,
+                    write_queue,
+                    prerender_enabled,
+                    connection_status,
+                    &mut last_cursor,
+                )
+                .await
+                {
+                    emit_sync_log(app_handle, "warning", &format!("SyncHub 增量拉取失败: {error}"));
+                }
+                publish_sync_nonterminal_status(app_handle, session_id, connection_status, "open")
+                    .await;
+            }
+
+            tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => {
+                    let _ = close_ws_with_deadline(&mut ws_stream).await;
+                    return Ok(());
+                }
+                command = rx.recv() => {
+                    match command {
+                        Some(SyncCommand::StartManualSync) | Some(SyncCommand::NotifyDelete { .. }) => {
+                            pending_push = true;
+                        }
+                        Some(_) => {}
+                        None => {
+                            let _ = close_ws_with_deadline(&mut ws_stream).await;
+                            return Ok(());
+                        }
+                    }
+                }
+                _ = poll.tick() => {
+                    pending_pull = true;
+                }
+                message = ws_stream.next() => {
+                    match message {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(header) = serde_json::from_str::<FrameHeader>(&text) {
+                                if header.frame_type == "REMOTE_CHANGE_AVAILABLE" {
+                                    let source_device_id = serde_json::from_str::<Value>(&text)
+                                        .ok()
+                                        .and_then(|value| {
+                                            value.get("sourceDeviceId")
+                                                .or_else(|| value.get("source_device_id"))
+                                                .cloned()
+                                        })
+                                        .and_then(|value| value.as_str().map(str::to_string))
+                                        .unwrap_or_default();
+                                    if source_device_id != device_id {
+                                        emit_sync_log(
+                                            app_handle,
+                                            "info",
+                                            "检测到其他设备更新，开始自动同步",
+                                        );
+                                        pending_pull = true;
+                                    }
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            let _ = send_ws_with_deadline(&mut ws_stream, Message::Pong(payload)).await;
+                        }
+                        Some(Ok(Message::Close(_))) | None => {
+                            emit_sync_log(app_handle, "warning", "SyncHub WebSocket 已断开，正在重连");
+                            break;
+                        }
+                        Some(Err(error)) => {
+                            emit_sync_log(
+                                app_handle,
+                                "warning",
+                                &format!("SyncHub WebSocket 错误: {error}"),
+                            );
+                            let _ = close_ws_with_deadline(&mut ws_stream).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn classify_connection_failure(err: &tokio_tungstenite::tungstenite::error::Error) -> &'static str {
     if let tokio_tungstenite::tungstenite::error::Error::Http(response) = err {
         let status = response.status();
@@ -1394,6 +1701,68 @@ async fn run_sync_session(
     'session: loop {
         if cancel_token.is_cancelled() {
             break;
+        }
+
+        match crate::vcp_modules::sync::sync_hub::probe_sync_hub(
+            &http_client,
+            &http_url,
+            &sync_token,
+        )
+        .await
+        {
+            crate::vcp_modules::sync::sync_hub::HubProbe::Hub => {
+                let _ = run_sync_hub_session(
+                    &handle_clone,
+                    session_id,
+                    &http_client,
+                    &http_url,
+                    &ws_url,
+                    &sync_token,
+                    &device_id,
+                    &write_queue_task,
+                    sync_prerender_enabled,
+                    &cancel_token,
+                    &mut rx,
+                    &connection_status_for_task,
+                )
+                .await;
+                break 'session;
+            }
+            crate::vcp_modules::sync::sync_hub::HubProbe::Unauthorized => {
+                publish_sync_error(
+                    &handle_clone,
+                    session_id,
+                    &connection_status_for_task,
+                    "TOKEN_MISMATCH",
+                    "SyncHub 同步令牌不匹配",
+                    Vec::new(),
+                )
+                .await;
+                emit_sync_log(
+                    &handle_clone,
+                    "error",
+                    "👉 排查建议: 手机端『同步令牌』必须与电脑 AppData/cloud-sync.json 的 syncToken 一致",
+                );
+                break 'session;
+            }
+            crate::vcp_modules::sync::sync_hub::HubProbe::Unreachable(message) => {
+                if schedule_sync_retry(
+                    &handle_clone,
+                    session_id,
+                    &connection_status_for_task,
+                    &cancel_token,
+                    &mut retry_count,
+                    &mut retry_delay,
+                    "SYNC_HUB_UNREACHABLE",
+                    &message,
+                )
+                .await
+                {
+                    continue 'session;
+                }
+                break 'session;
+            }
+            crate::vcp_modules::sync::sync_hub::HubProbe::NotHub => {}
         }
 
         publish_sync_nonterminal_status(
