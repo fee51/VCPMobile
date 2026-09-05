@@ -525,6 +525,9 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
   const close = async () => {
     if (!isOpen.value || !canDismiss.value) return;
     const shouldReload = needsReload.value;
+    // Dismissing a successful progress view must not disconnect the app-owned
+    // background sync session. Retry/error cleanup still stops it explicitly.
+    const keepBackgroundSync = status.value === "completed" || status.value === "completed_with_warnings";
     needsReload.value = false;
     viewGeneration += 1;
     startAttempt += 1;
@@ -537,10 +540,12 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     cleanupListeners();
     listenerSetup = null;
 
-    try {
-      await invoke("stop_sync");
-    } catch (e) {
-      console.warn("[SyncSession] Failed to stop backend sync session:", e);
+    if (!keepBackgroundSync) {
+      try {
+        await invoke("stop_sync");
+      } catch (e) {
+        console.warn("[SyncSession] Failed to stop backend sync session:", e);
+      }
     }
     if (shouldReload) {
       try {

@@ -6460,7 +6460,7 @@ dependencies = [
 
 [[package]]
 name = "vcp-mobile"
-version = "1.1.9"
+version = "1.1.10"
 dependencies = [
  "async-trait",
  "axum",

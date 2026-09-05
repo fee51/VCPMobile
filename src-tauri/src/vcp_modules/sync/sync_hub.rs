@@ -382,6 +382,7 @@ pub async fn apply_snapshot(
     snapshot: &HubSnapshot,
     write_queue: &DbWriteQueue,
     prerender_enabled: bool,
+    pool: &sqlx::SqlitePool,
 ) -> Result<HubApplySummary, String> {
     let grouped = group_snapshot(snapshot);
     let mut summary = HubApplySummary {
@@ -481,7 +482,12 @@ pub async fn apply_snapshot(
         }
     }
 
-    summary.topics = agent_topics.len() + group_topics.len();
+    let modified_topics = agent_topics
+        .iter()
+        .map(|(key, _)| key.clone())
+        .chain(group_topics.iter().map(|(key, _)| key.clone()))
+        .collect::<HashSet<_>>();
+    summary.topics = modified_topics.len();
     if !agent_topics.is_empty() {
         write_queue
             .submit(DbWriteTask::AgentTopicBatch {
@@ -513,6 +519,10 @@ pub async fn apply_snapshot(
             apply_pulled_topic_messages(&key, messages, write_queue, prerender_enabled).await?;
     }
     write_queue.flush().await?;
+    // Snapshot imports bypass the ordinary Wire phase controller. Explicitly
+    // finalize counts/hashes before notifying the UI, including empty topics.
+    crate::vcp_modules::sync::sync_finalize::finalize_modified_topics(pool, &modified_topics)
+        .await?;
     summary.legacy_attachment_warnings = warnings.count;
     summary.warning_samples = warnings.samples;
     Ok(summary)
@@ -524,9 +534,10 @@ pub async fn pull_and_apply(
     sync_token: &str,
     write_queue: &DbWriteQueue,
     prerender_enabled: bool,
+    pool: &sqlx::SqlitePool,
 ) -> Result<HubApplySummary, String> {
     let snapshot = fetch_snapshot(client, http_url, sync_token).await?;
-    apply_snapshot(&snapshot, write_queue, prerender_enabled).await
+    apply_snapshot(&snapshot, write_queue, prerender_enabled, pool).await
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1136,7 +1147,7 @@ mod tests {
             {"name": "valid.png", "_fileManagerData": {"hash": "a".repeat(64)}}
         ]);
         for _ in 0..2 {
-            let summary = apply_snapshot(&snapshot, &queue, false)
+            let summary = apply_snapshot(&snapshot, &queue, false, &pool)
                 .await
                 .expect("legacy attachment must not roll back message writes");
             assert_eq!(summary.messages, 2);
@@ -1157,6 +1168,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(attachments, 1);
+            let counts: Vec<i64> =
+                sqlx::query_scalar("SELECT msg_count FROM topics ORDER BY topic_id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(counts, vec![1, 1], "snapshot must update both topic badges");
         }
         assert!(snapshot.messages[0].payload["attachments"][0]
             .get("hash")

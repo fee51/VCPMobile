@@ -17,7 +17,7 @@ struct TopicBubbleMeta {
 }
 
 #[derive(Debug)]
-struct FinalizationStats {
+pub(crate) struct FinalizationStats {
     bubbled_topics: usize,
     affected_agents: usize,
     affected_groups: usize,
@@ -25,7 +25,7 @@ struct FinalizationStats {
 
 const SQLITE_TOPIC_CHUNK: usize = 300;
 
-async fn finalize_modified_topics(
+pub(crate) async fn finalize_modified_topics(
     pool: &sqlx::SqlitePool,
     modified_topics: &HashSet<TopicKey>,
 ) -> Result<FinalizationStats, String> {

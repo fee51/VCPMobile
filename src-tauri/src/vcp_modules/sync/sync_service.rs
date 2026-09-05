@@ -1250,22 +1250,24 @@ async fn pull_sync_hub_snapshot(
     last_cursor: &mut Option<u64>,
 ) -> Result<(), String> {
     emit_sync_log(app_handle, "info", "正在从云端 SyncHub 拉取快照...");
-    let summary = crate::vcp_modules::sync::sync_hub::pull_and_apply(
-        http_client,
-        http_url,
-        sync_token,
-        write_queue,
-        prerender_enabled,
-    )
-    .await?;
-    if last_cursor.is_some_and(|cursor| cursor == summary.cursor) {
+    let snapshot =
+        crate::vcp_modules::sync::sync_hub::fetch_snapshot(http_client, http_url, sync_token)
+            .await?;
+    if last_cursor.is_some_and(|cursor| cursor == snapshot.latest_cursor) {
         emit_sync_log(
             app_handle,
             "info",
-            &format!("SyncHub 快照无新变更 (cursor={})", summary.cursor),
+            &format!("SyncHub 快照无新变更 (cursor={})", snapshot.latest_cursor),
         );
         return Ok(());
     }
+    let summary = crate::vcp_modules::sync::sync_hub::apply_snapshot(
+        &snapshot,
+        write_queue,
+        prerender_enabled,
+        &app_handle.state::<DbState>().pool,
+    )
+    .await?;
     crate::vcp_modules::sync::sync_finalize::invalidate_sync_entity_caches(app_handle);
     let completion = SyncCompletionSummary {
         successful_topics: summary.topics,

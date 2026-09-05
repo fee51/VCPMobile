@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import { mount } from "@vue/test-utils";
+import { flushPromises, mount } from "@vue/test-utils";
 import { shareFileNative } from "tauri-plugin-vcp-mobile";
 import { useSyncSessionStore } from "@/core/stores/syncSession";
 import { useOverlayStore } from "@/core/stores/overlay";
@@ -210,7 +210,7 @@ describe("sync session ownership", () => {
   });
 
   it.each(["idle", "error", "completed", "completed_with_warnings"] as const)(
-    "dismisses a %s panel through system back and still requests backend stop",
+    "dismisses a %s panel without stopping a successful background session",
     async (terminalStatus) => {
       const overlay = useOverlayStore();
       const store = useSyncSessionStore();
@@ -251,11 +251,10 @@ describe("sync session ownership", () => {
 
       expect(store.isOpen).toBe(false);
       expect(overlay.isSyncSessionOpen).toBe(false);
-      await vi.waitFor(() =>
-        expect(
-          invokeMock.mock.calls.some(([command]) => command === "stop_sync"),
-        ).toBe(true),
-      );
+      await flushPromises();
+      expect(
+        invokeMock.mock.calls.some(([command]) => command === "stop_sync"),
+      ).toBe(terminalStatus === "idle" || terminalStatus === "error");
     },
   );
 
