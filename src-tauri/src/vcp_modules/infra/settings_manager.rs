@@ -565,14 +565,12 @@ mod tests {
 
     #[test]
     fn fresh_install_defaults_to_standard_chat() {
-        assert_eq!(
-            create_default_settings().chat_endpoint_mode,
-            ChatEndpointMode::Standard
-        );
+        let settings = create_default_settings();
+        assert_eq!(settings.chat_endpoint_mode, ChatEndpointMode::Standard);
         assert!(
-            legacy.sync_device_id.starts_with("mobile-"),
+            settings.sync_device_id.starts_with("mobile-"),
             "missing device id should be generated: {}",
-            legacy.sync_device_id
+            settings.sync_device_id
         );
     }
 

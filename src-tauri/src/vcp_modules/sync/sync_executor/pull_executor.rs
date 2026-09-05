@@ -203,10 +203,10 @@ enum ParsedNdjsonFrame {
     Topic(TopicNDJSONFrame),
 }
 
-#[derive(Default)]
-struct BoundedWarnings {
-    count: usize,
-    samples: Vec<String>,
+#[derive(Debug, Default)]
+pub(crate) struct BoundedWarnings {
+    pub(crate) count: usize,
+    pub(crate) samples: Vec<String>,
 }
 
 impl BoundedWarnings {
@@ -328,6 +328,37 @@ fn canonicalize_attachment(
     object.remove("filePath");
     object.remove("status");
     Ok(Some(Value::Object(object)))
+}
+
+/// Both the Wire pull and SyncHub snapshot must cross this boundary before
+/// constructing ChatMessage: desktop legacy paths are not mobile CAS records.
+pub(crate) fn canonicalize_message_attachments(
+    message: &mut serde_json::Map<String, Value>,
+    message_id: &str,
+    warnings: &mut BoundedWarnings,
+) -> Result<(), String> {
+    match message.remove("attachments") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(attachments)) => {
+            let mut canonical = Vec::with_capacity(attachments.len());
+            for (index, attachment) in attachments.into_iter().enumerate() {
+                if let Some(attachment) =
+                    canonicalize_attachment(attachment, message_id, index, warnings)?
+                {
+                    canonical.push(attachment);
+                }
+            }
+            if !canonical.is_empty() {
+                message.insert("attachments".to_string(), Value::Array(canonical));
+            }
+        }
+        Some(_) => {
+            return Err(format!(
+                "Message {message_id} attachments must be an array or null"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_ndjson_frame(bytes: &[u8]) -> Result<ParsedNdjsonFrame, String> {
@@ -527,27 +558,7 @@ fn parse_topic_ndjson_value(value: Value) -> Result<TopicNDJSONFrame, String> {
         message.remove("contentHash");
         message.remove("content_hash");
 
-        match message.remove("attachments") {
-            None | Some(Value::Null) => {}
-            Some(Value::Array(attachments)) => {
-                let mut canonical = Vec::with_capacity(attachments.len());
-                for (index, attachment) in attachments.into_iter().enumerate() {
-                    if let Some(attachment) =
-                        canonicalize_attachment(attachment, &message_id, index, &mut warnings)?
-                    {
-                        canonical.push(attachment);
-                    }
-                }
-                if !canonical.is_empty() {
-                    message.insert("attachments".to_string(), Value::Array(canonical));
-                }
-            }
-            Some(_) => {
-                return Err(format!(
-                    "Message {message_id} attachments must be an array or null"
-                ));
-            }
-        }
+        canonicalize_message_attachments(&mut message, &message_id, &mut warnings)?;
 
         let dto = serde_json::from_value(Value::Object(message)).map_err(|error| {
             format!("Message {message_id} violates the canonical message contract: {error}")

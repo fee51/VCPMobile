@@ -1271,7 +1271,7 @@ async fn pull_sync_hub_snapshot(
         successful_topics: summary.topics,
         total_topics: summary.topics,
         failed_topics: 0,
-        legacy_attachment_warnings: 0,
+        legacy_attachment_warnings: summary.legacy_attachment_warnings,
         failed_topic_ids: Vec::new(),
     };
     if last_cursor.is_none() {
@@ -1288,17 +1288,38 @@ async fn pull_sync_hub_snapshot(
             json!({
                 "source": "Sync",
                 "sessionId": session_id,
-                "status": "completed",
+                "status": if summary.legacy_attachment_warnings > 0 {
+                    "completed_with_warnings"
+                } else {
+                    "completed"
+                },
                 "summary": completion,
             }),
         );
+    }
+    if summary.legacy_attachment_warnings > 0 {
+        emit_sync_log(
+            app_handle,
+            "warning",
+            &format!(
+                "SyncHub 有 {} 个旧附件缺少有效哈希，已跳过附件索引但保留聊天正文；电脑和云端原始附件数据不变",
+                summary.legacy_attachment_warnings
+            ),
+        );
+        for sample in &summary.warning_samples {
+            emit_sync_log(app_handle, "warning", sample);
+        }
     }
     emit_sync_log(
         app_handle,
         "success",
         &format!(
-            "SyncHub 同步完成: agents={}, topics={}, messages={}, cursor={}",
-            summary.agents, summary.topics, summary.messages, summary.cursor
+            "SyncHub 同步完成: agents={}, topics={}, messages={}, attachmentWarnings={}, cursor={}",
+            summary.agents,
+            summary.topics,
+            summary.messages,
+            summary.legacy_attachment_warnings,
+            summary.cursor
         ),
     );
     *last_cursor = Some(summary.cursor);
@@ -1397,7 +1418,11 @@ async fn run_sync_hub_session(
                 continue;
             }
             Err(_) => {
-                emit_sync_log(app_handle, "warning", "SyncHub WebSocket 连接超时；将继续轮询快照");
+                emit_sync_log(
+                    app_handle,
+                    "warning",
+                    "SyncHub WebSocket 连接超时；将继续轮询快照",
+                );
                 if cancelled_during(cancel_token, retry_delay).await {
                     return Ok(());
                 }
@@ -1469,7 +1494,11 @@ async fn run_sync_hub_session(
                 )
                 .await
                 {
-                    emit_sync_log(app_handle, "warning", &format!("SyncHub 增量拉取失败: {error}"));
+                    emit_sync_log(
+                        app_handle,
+                        "warning",
+                        &format!("SyncHub 增量拉取失败: {error}"),
+                    );
                 }
                 publish_sync_nonterminal_status(app_handle, session_id, connection_status, "open")
                     .await;
