@@ -1244,15 +1244,47 @@ async fn pull_sync_hub_snapshot(
     http_client: &reqwest::Client,
     http_url: &str,
     sync_token: &str,
+    device_id: &str,
     write_queue: &DbWriteQueue,
     prerender_enabled: bool,
     connection_status: &Arc<RwLock<String>>,
     last_cursor: &mut Option<u64>,
 ) -> Result<(), String> {
+    if let Some(cursor) = *last_cursor {
+        match crate::vcp_modules::sync::sync_hub::fetch_hub_status(
+            http_client,
+            http_url,
+            sync_token,
+            device_id,
+        )
+        .await
+        {
+            Ok(status) if status.latest_cursor == cursor => {
+                emit_sync_log(
+                    app_handle,
+                    "info",
+                    &format!("SyncHub 无新变更 (cursor={cursor})"),
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                emit_sync_log(
+                    app_handle,
+                    "warning",
+                    &format!("SyncHub 状态检查失败，回退全量快照: {error}"),
+                );
+            }
+        }
+    }
     emit_sync_log(app_handle, "info", "正在从云端 SyncHub 拉取快照...");
-    let snapshot =
-        crate::vcp_modules::sync::sync_hub::fetch_snapshot(http_client, http_url, sync_token)
-            .await?;
+    let snapshot = crate::vcp_modules::sync::sync_hub::fetch_snapshot(
+        http_client,
+        http_url,
+        sync_token,
+        device_id,
+    )
+    .await?;
     if last_cursor.is_some_and(|cursor| cursor == snapshot.latest_cursor) {
         emit_sync_log(
             app_handle,
@@ -1350,13 +1382,13 @@ async fn run_sync_hub_session(
     publish_sync_nonterminal_status(app_handle, session_id, connection_status, "connecting").await;
 
     let mut last_cursor = None;
-    let mut last_push_watermark: Option<i64> = None;
     if let Err(error) = pull_sync_hub_snapshot(
         app_handle,
         session_id,
         http_client,
         http_url,
         sync_token,
+        device_id,
         write_queue,
         prerender_enabled,
         connection_status,
@@ -1375,6 +1407,9 @@ async fn run_sync_hub_session(
         .await;
         return Err(error);
     }
+    // Anything already applied from the snapshot must not be re-uploaded as a
+    // lossy mobile projection. Only messages written after this watermark go up.
+    let mut last_push_watermark = Some(chrono::Utc::now().timestamp_millis());
 
     publish_sync_nonterminal_status(app_handle, session_id, connection_status, "open").await;
 
@@ -1408,6 +1443,7 @@ async fn run_sync_hub_session(
                     http_client,
                     http_url,
                     sync_token,
+                    device_id,
                     write_queue,
                     prerender_enabled,
                     connection_status,
@@ -1456,6 +1492,7 @@ async fn run_sync_hub_session(
                     http_client,
                     http_url,
                     sync_token,
+                    device_id,
                     &db.pool,
                     since,
                 )
@@ -1489,6 +1526,7 @@ async fn run_sync_hub_session(
                     http_client,
                     http_url,
                     sync_token,
+                    device_id,
                     write_queue,
                     prerender_enabled,
                     connection_status,
@@ -1738,6 +1776,7 @@ async fn run_sync_session(
             &http_client,
             &http_url,
             &sync_token,
+            &device_id,
         )
         .await
         {

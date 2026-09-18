@@ -13,6 +13,7 @@ use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 
 const HUB_SNAPSHOT_PATH: &str = "/api/sync-hub/snapshot";
+const HUB_STATUS_PATH: &str = "/api/sync-hub/status";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HubProbe {
@@ -31,6 +32,15 @@ pub struct HubApplySummary {
     pub messages: usize,
     pub legacy_attachment_warnings: usize,
     pub warning_samples: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HubStatus {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub latest_cursor: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +88,10 @@ pub struct GroupedHubSnapshot {
 
 fn snapshot_url(http_url: &str) -> String {
     format!("{}{}", http_url.trim_end_matches('/'), HUB_SNAPSHOT_PATH)
+}
+
+fn status_url(http_url: &str) -> String {
+    format!("{}{}", http_url.trim_end_matches('/'), HUB_STATUS_PATH)
 }
 
 fn json_string(value: &Value, key: &str) -> Option<String> {
@@ -303,11 +317,13 @@ async fn authorized_get(
     client: &reqwest::Client,
     url: &str,
     sync_token: &str,
+    device_id: &str,
 ) -> Result<reqwest::Response, reqwest::Error> {
     client
         .get(url)
         .header("Authorization", format!("Bearer {sync_token}"))
         .header("x-sync-token", sync_token)
+        .header("x-device-id", device_id)
         .send()
         .await
 }
@@ -316,8 +332,9 @@ pub async fn probe_sync_hub(
     client: &reqwest::Client,
     http_url: &str,
     sync_token: &str,
+    device_id: &str,
 ) -> HubProbe {
-    match fetch_snapshot_inner(client, http_url, sync_token).await {
+    match fetch_hub_status_inner(client, http_url, sync_token, device_id).await {
         Ok(_) => HubProbe::Hub,
         Err(HubFetchError::Unauthorized) => HubProbe::Unauthorized,
         Err(HubFetchError::NotHub) => HubProbe::NotHub,
@@ -335,29 +352,40 @@ enum HubFetchError {
     Invalid(String),
 }
 
+fn map_hub_fetch_error(error: HubFetchError) -> String {
+    match error {
+        HubFetchError::Unauthorized => "SyncHub unauthorized".to_string(),
+        HubFetchError::NotHub => "server is not SyncHub".to_string(),
+        HubFetchError::Transport(message) | HubFetchError::Invalid(message) => message,
+    }
+}
+
+pub async fn fetch_hub_status(
+    client: &reqwest::Client,
+    http_url: &str,
+    sync_token: &str,
+    device_id: &str,
+) -> Result<HubStatus, String> {
+    fetch_hub_status_inner(client, http_url, sync_token, device_id)
+        .await
+        .map_err(map_hub_fetch_error)
+}
+
 pub async fn fetch_snapshot(
     client: &reqwest::Client,
     http_url: &str,
     sync_token: &str,
+    device_id: &str,
 ) -> Result<HubSnapshot, String> {
-    fetch_snapshot_inner(client, http_url, sync_token)
+    fetch_snapshot_inner(client, http_url, sync_token, device_id)
         .await
-        .map_err(|error| match error {
-            HubFetchError::Unauthorized => "SyncHub unauthorized".to_string(),
-            HubFetchError::NotHub => "server is not SyncHub".to_string(),
-            HubFetchError::Transport(message) | HubFetchError::Invalid(message) => message,
-        })
+        .map_err(map_hub_fetch_error)
 }
 
-async fn fetch_snapshot_inner(
-    client: &reqwest::Client,
-    http_url: &str,
-    sync_token: &str,
-) -> Result<HubSnapshot, HubFetchError> {
-    let url = snapshot_url(http_url);
-    let response = authorized_get(client, &url, sync_token)
-        .await
-        .map_err(|error| HubFetchError::Transport(error.to_string()))?;
+async fn classify_hub_response(
+    response: reqwest::Response,
+    path: &str,
+) -> Result<reqwest::Response, HubFetchError> {
     let status = response.status();
     if status.as_u16() == 401 || status.as_u16() == 403 {
         return Err(HubFetchError::Unauthorized);
@@ -367,15 +395,43 @@ async fn fetch_snapshot_inner(
     }
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(HubFetchError::Transport(format!(
-            "GET {HUB_SNAPSHOT_PATH} failed: {status} {body}"
-        )));
+        return Err(HubFetchError::Transport(format!("GET {path} failed: {status} {body}")));
     }
-    let snapshot = response
+    Ok(response)
+}
+
+async fn fetch_hub_status_inner(
+    client: &reqwest::Client,
+    http_url: &str,
+    sync_token: &str,
+    device_id: &str,
+) -> Result<HubStatus, HubFetchError> {
+    let url = status_url(http_url);
+    let response = authorized_get(client, &url, sync_token, device_id)
+        .await
+        .map_err(|error| HubFetchError::Transport(error.to_string()))?;
+    let response = classify_hub_response(response, HUB_STATUS_PATH).await?;
+    response
+        .json::<HubStatus>()
+        .await
+        .map_err(|error| HubFetchError::Invalid(format!("invalid SyncHub status: {error}")))
+}
+
+async fn fetch_snapshot_inner(
+    client: &reqwest::Client,
+    http_url: &str,
+    sync_token: &str,
+    device_id: &str,
+) -> Result<HubSnapshot, HubFetchError> {
+    let url = snapshot_url(http_url);
+    let response = authorized_get(client, &url, sync_token, device_id)
+        .await
+        .map_err(|error| HubFetchError::Transport(error.to_string()))?;
+    let response = classify_hub_response(response, HUB_SNAPSHOT_PATH).await?;
+    response
         .json::<HubSnapshot>()
         .await
-        .map_err(|error| HubFetchError::Invalid(format!("invalid SyncHub snapshot: {error}")))?;
-    Ok(snapshot)
+        .map_err(|error| HubFetchError::Invalid(format!("invalid SyncHub snapshot: {error}")))
 }
 
 pub async fn apply_snapshot(
@@ -532,11 +588,12 @@ pub async fn pull_and_apply(
     client: &reqwest::Client,
     http_url: &str,
     sync_token: &str,
+    device_id: &str,
     write_queue: &DbWriteQueue,
     prerender_enabled: bool,
     pool: &sqlx::SqlitePool,
 ) -> Result<HubApplySummary, String> {
-    let snapshot = fetch_snapshot(client, http_url, sync_token).await?;
+    let snapshot = fetch_snapshot(client, http_url, sync_token, device_id).await?;
     apply_snapshot(&snapshot, write_queue, prerender_enabled, pool).await
 }
 
@@ -564,12 +621,14 @@ async fn authorized_post_json(
     client: &reqwest::Client,
     url: &str,
     sync_token: &str,
+    device_id: &str,
     body: &Value,
 ) -> Result<reqwest::Response, String> {
     client
         .post(url)
         .header("Authorization", format!("Bearer {sync_token}"))
         .header("x-sync-token", sync_token)
+        .header("x-device-id", device_id)
         .json(body)
         .send()
         .await
@@ -580,12 +639,14 @@ async fn authorized_post_ndjson(
     client: &reqwest::Client,
     url: &str,
     sync_token: &str,
+    device_id: &str,
     body: Vec<u8>,
 ) -> Result<reqwest::Response, String> {
     client
         .post(url)
         .header("Authorization", format!("Bearer {sync_token}"))
         .header("x-sync-token", sync_token)
+        .header("x-device-id", device_id)
         .header("content-type", "application/x-ndjson")
         .body(body)
         .send()
@@ -597,6 +658,7 @@ async fn upload_entity(
     client: &reqwest::Client,
     http_url: &str,
     sync_token: &str,
+    device_id: &str,
     entity_type: &str,
     id: &str,
     data: Value,
@@ -609,6 +671,7 @@ async fn upload_entity(
         client,
         &url,
         sync_token,
+        device_id,
         &json!({ "id": id, "type": entity_type, "data": data }),
     )
     .await?;
@@ -626,6 +689,7 @@ async fn upload_message_batch(
     client: &reqwest::Client,
     http_url: &str,
     sync_token: &str,
+    device_id: &str,
     topic_id: &str,
     messages: &[Value],
 ) -> Result<(), String> {
@@ -660,7 +724,7 @@ async fn upload_message_batch(
         );
         body.push(b'\n');
     }
-    let response = authorized_post_ndjson(client, &url, sync_token, body).await?;
+    let response = authorized_post_ndjson(client, &url, sync_token, device_id, body).await?;
     if !response.status().is_success() {
         return Err(format!(
             "upload-messages-batch {topic_id} failed: {} {}",
@@ -675,6 +739,7 @@ async fn delete_remote_message(
     client: &reqwest::Client,
     http_url: &str,
     sync_token: &str,
+    device_id: &str,
     message_id: &str,
 ) -> Result<(), String> {
     let url = format!(
@@ -685,6 +750,7 @@ async fn delete_remote_message(
         client,
         &url,
         sync_token,
+        device_id,
         &json!({ "msgId": message_id, "deletedAt": chrono::Utc::now().timestamp_millis() }),
     )
     .await?;
@@ -701,6 +767,7 @@ async fn delete_remote_message(
 // The phone stores a normalized projection, not all desktop metadata. Overlay
 // local edits onto the original payload so a later push cannot erase legacy
 // attachments that were intentionally omitted from the mobile CAS index.
+#[allow(dead_code)]
 fn merge_remote_message_payload(remote: Option<&Value>, local: &Value) -> Value {
     let mut merged = remote
         .and_then(Value::as_object)
@@ -716,6 +783,7 @@ pub async fn push_local_changes(
     client: &reqwest::Client,
     http_url: &str,
     sync_token: &str,
+    device_id: &str,
     pool: &sqlx::SqlitePool,
     since_timestamp: i64,
 ) -> Result<HubPushSummary, String> {
@@ -791,32 +859,8 @@ pub async fn push_local_changes(
             }));
     }
 
-    // Do this before any upload. If the remote original cannot be read, fail
-    // closed rather than replace it with a lossy mobile-only representation.
-    let mut remote_payloads = HashMap::new();
-    if !messages_by_topic.is_empty() {
-        for message in fetch_snapshot(client, http_url, sync_token).await?.messages {
-            let id = message
-                .message_id
-                .or_else(|| json_string(&message.payload, "id"))
-                .or_else(|| json_string(&message.payload, "messageId"));
-            if let Some(id) = id {
-                remote_payloads.insert((message.topic_id, id), message.payload);
-            }
-        }
-    }
-    for ((_owner_type, owner_id, topic_id), messages) in &mut messages_by_topic {
-        let wire_topic = hub_topic_key(owner_id, topic_id);
-        let full_topic = format!("{owner_id}/{topic_id}");
-        for message in messages {
-            if let Some(id) = json_string(message, "id") {
-                let remote = remote_payloads
-                    .get(&(wire_topic.clone(), id.clone()))
-                    .or_else(|| remote_payloads.get(&(full_topic.clone(), id)));
-                *message = merge_remote_message_payload(remote, message);
-            }
-        }
-    }
+    // Only upload messages newer than the last successful pull/push watermark.
+    // Fetching the 50MB+ snapshot here previously stalled phone uploads.
 
     for (owner_type, owner_id) in &owners {
         if owner_type == "group" {
@@ -833,6 +877,7 @@ pub async fn push_local_changes(
                     client,
                     http_url,
                     sync_token,
+                    device_id,
                     "group",
                     owner_id,
                     json!({
@@ -863,6 +908,7 @@ pub async fn push_local_changes(
                 client,
                 http_url,
                 sync_token,
+                device_id,
                 "agent",
                 owner_id,
                 json!({
@@ -897,6 +943,7 @@ pub async fn push_local_changes(
             client,
             http_url,
             sync_token,
+            device_id,
             entity_type,
             &entity_topic_id,
             json!({
@@ -915,7 +962,7 @@ pub async fn push_local_changes(
 
     for ((_owner_type, owner_id, topic_id), messages) in &messages_by_topic {
         let topic_key = hub_topic_key(owner_id, topic_id);
-        upload_message_batch(client, http_url, sync_token, &topic_key, messages).await?;
+        upload_message_batch(client, http_url, sync_token, device_id, &topic_key, messages).await?;
         summary.messages += messages.len();
     }
 
@@ -927,7 +974,7 @@ pub async fn push_local_changes(
             .map_err(|error| format!("load local deletions failed: {error}"))?;
     for row in deleted_rows {
         let msg_id: String = row.get("msg_id");
-        delete_remote_message(client, http_url, sync_token, &msg_id).await?;
+        delete_remote_message(client, http_url, sync_token, device_id, &msg_id).await?;
         summary.deleted_messages += 1;
     }
 
@@ -937,6 +984,18 @@ pub async fn push_local_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_probe_uses_lightweight_hub_status_path() {
+        assert_eq!(
+            status_url("https://hub-vcp.example/hub"),
+            "https://hub-vcp.example/hub/api/sync-hub/status"
+        );
+        assert_eq!(
+            snapshot_url("https://hub-vcp.example/hub/"),
+            "https://hub-vcp.example/hub/api/sync-hub/snapshot"
+        );
+    }
 
     fn snapshot_fixture() -> HubSnapshot {
         HubSnapshot {
