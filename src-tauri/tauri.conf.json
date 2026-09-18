@@ -31,7 +31,7 @@
     "targets": "all",
     "android": {
       "minSdkVersion": 26,
-      "versionCode": 1001010,
+      "versionCode": 1001011,
       "debugApplicationIdSuffix": ".debug"
     },
     "resources": [],
