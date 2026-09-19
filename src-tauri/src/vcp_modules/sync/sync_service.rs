@@ -1249,7 +1249,7 @@ async fn pull_sync_hub_snapshot(
     prerender_enabled: bool,
     connection_status: &Arc<RwLock<String>>,
     last_cursor: &mut Option<u64>,
-) -> Result<(), String> {
+) -> Result<HashSet<String>, String> {
     if let Some(cursor) = *last_cursor {
         match crate::vcp_modules::sync::sync_hub::fetch_hub_status(
             http_client,
@@ -1265,7 +1265,7 @@ async fn pull_sync_hub_snapshot(
                     "info",
                     &format!("SyncHub 无新变更 (cursor={cursor})"),
                 );
-                return Ok(());
+                return Ok(HashSet::new());
             }
             Ok(_) => {}
             Err(error) => {
@@ -1291,8 +1291,9 @@ async fn pull_sync_hub_snapshot(
             "info",
             &format!("SyncHub 快照无新变更 (cursor={})", snapshot.latest_cursor),
         );
-        return Ok(());
+        return Ok(HashSet::new());
     }
+    let remote_ids = crate::vcp_modules::sync::sync_hub::snapshot_message_ids(&snapshot);
     let summary = crate::vcp_modules::sync::sync_hub::apply_snapshot(
         &snapshot,
         write_queue,
@@ -1357,7 +1358,7 @@ async fn pull_sync_hub_snapshot(
         ),
     );
     *last_cursor = Some(summary.cursor);
-    Ok(())
+    Ok(remote_ids)
 }
 
 async fn run_sync_hub_session(
@@ -1382,7 +1383,9 @@ async fn run_sync_hub_session(
     publish_sync_nonterminal_status(app_handle, session_id, connection_status, "connecting").await;
 
     let mut last_cursor = None;
-    if let Err(error) = pull_sync_hub_snapshot(
+    let mut known_ids = HashSet::new();
+    let pull_started_at = chrono::Utc::now().timestamp_millis();
+    match pull_sync_hub_snapshot(
         app_handle,
         session_id,
         http_client,
@@ -1396,20 +1399,57 @@ async fn run_sync_hub_session(
     )
     .await
     {
-        publish_sync_error(
-            app_handle,
-            session_id,
-            connection_status,
-            "SYNC_HUB_PULL_FAILED",
-            &error,
-            Vec::new(),
-        )
-        .await;
-        return Err(error);
+        Ok(ids) => known_ids.extend(ids),
+        Err(error) => {
+            publish_sync_error(
+                app_handle,
+                session_id,
+                connection_status,
+                "SYNC_HUB_PULL_FAILED",
+                &error,
+                Vec::new(),
+            )
+            .await;
+            return Err(error);
+        }
     }
-    // Anything already applied from the snapshot must not be re-uploaded as a
-    // lossy mobile projection. Only messages written after this watermark go up.
-    let mut last_push_watermark = Some(chrono::Utc::now().timestamp_millis());
+    // Snapshot rows keep their original timestamps, so a cutoff taken *before*
+    // the pull still uploads phone-only messages without rewriting Hub history.
+    let mut last_push_watermark = Some(pull_started_at);
+    {
+        let now = chrono::Utc::now().timestamp_millis();
+        let since = last_push_watermark.unwrap_or(pull_started_at);
+        let db = app_handle.state::<DbState>();
+        match crate::vcp_modules::sync::sync_hub::push_local_changes(
+            http_client,
+            http_url,
+            sync_token,
+            device_id,
+            &db.pool,
+            since,
+            &mut known_ids,
+        )
+        .await
+        {
+            Ok(summary) => {
+                last_push_watermark = Some(now.saturating_sub(60_000));
+                emit_sync_log(
+                    app_handle,
+                    "success",
+                    &format!(
+                        "已上传到 SyncHub: entities={}, topics={}, messages={}, deleted={}",
+                        summary.entities,
+                        summary.topics,
+                        summary.messages,
+                        summary.deleted_messages
+                    ),
+                );
+            }
+            Err(error) => {
+                emit_sync_log(app_handle, "warning", &format!("SyncHub 上传失败: {error}"));
+            }
+        }
+    }
 
     publish_sync_nonterminal_status(app_handle, session_id, connection_status, "open").await;
 
@@ -1437,7 +1477,7 @@ async fn run_sync_hub_session(
                     return Ok(());
                 }
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
-                if let Err(error) = pull_sync_hub_snapshot(
+                match pull_sync_hub_snapshot(
                     app_handle,
                     session_id,
                     http_client,
@@ -1451,7 +1491,10 @@ async fn run_sync_hub_session(
                 )
                 .await
                 {
-                    emit_sync_log(app_handle, "warning", &format!("SyncHub 轮询失败: {error}"));
+                    Ok(ids) => known_ids.extend(ids),
+                    Err(error) => {
+                        emit_sync_log(app_handle, "warning", &format!("SyncHub 轮询失败: {error}"));
+                    }
                 }
                 continue;
             }
@@ -1495,6 +1538,7 @@ async fn run_sync_hub_session(
                     device_id,
                     &db.pool,
                     since,
+                    &mut known_ids,
                 )
                 .await
                 {
@@ -1520,7 +1564,7 @@ async fn run_sync_hub_session(
             }
             if pending_pull {
                 pending_pull = false;
-                if let Err(error) = pull_sync_hub_snapshot(
+                match pull_sync_hub_snapshot(
                     app_handle,
                     session_id,
                     http_client,
@@ -1534,11 +1578,14 @@ async fn run_sync_hub_session(
                 )
                 .await
                 {
-                    emit_sync_log(
-                        app_handle,
-                        "warning",
-                        &format!("SyncHub 增量拉取失败: {error}"),
-                    );
+                    Ok(ids) => known_ids.extend(ids),
+                    Err(error) => {
+                        emit_sync_log(
+                            app_handle,
+                            "warning",
+                            &format!("SyncHub 增量拉取失败: {error}"),
+                        );
+                    }
                 }
                 publish_sync_nonterminal_status(app_handle, session_id, connection_status, "open")
                     .await;
@@ -1563,6 +1610,7 @@ async fn run_sync_hub_session(
                     }
                 }
                 _ = poll.tick() => {
+                    pending_push = true;
                     pending_pull = true;
                 }
                 message = ws_stream.next() => {

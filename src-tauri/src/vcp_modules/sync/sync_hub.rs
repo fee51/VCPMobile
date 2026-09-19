@@ -86,6 +86,21 @@ pub struct GroupedHubSnapshot {
     pub messages_by_topic: HashMap<(String, String, String), Vec<Value>>,
 }
 
+pub fn snapshot_message_ids(snapshot: &HubSnapshot) -> HashSet<String> {
+    snapshot
+        .messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .message_id
+                .clone()
+                .or_else(|| json_string(&message.payload, "id"))
+                .or_else(|| json_string(&message.payload, "messageId"))
+        })
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
 fn snapshot_url(http_url: &str) -> String {
     format!("{}{}", http_url.trim_end_matches('/'), HUB_SNAPSHOT_PATH)
 }
@@ -786,6 +801,7 @@ pub async fn push_local_changes(
     device_id: &str,
     pool: &sqlx::SqlitePool,
     since_timestamp: i64,
+    known_ids: &mut HashSet<String>,
 ) -> Result<HubPushSummary, String> {
     let mut summary = HubPushSummary::default();
     let topic_rows = sqlx::query(
@@ -818,10 +834,9 @@ pub async fn push_local_changes(
         "SELECT owner_type, owner_id, topic_id, msg_id, role, name, agent_id, content, timestamp,
                 is_group_message, group_id, finish_reason, updated_at
          FROM messages
-         WHERE deleted_at IS NULL AND timestamp >= ?
+         WHERE deleted_at IS NULL
          ORDER BY owner_type, owner_id, topic_id, timestamp, msg_id",
     )
-    .bind(since_timestamp)
     .fetch_all(pool)
     .await
     .map_err(|error| format!("load local messages failed: {error}"))?;
@@ -840,6 +855,9 @@ pub async fn push_local_changes(
         let msg_id: String = row.get("msg_id");
         let timestamp: i64 = row.get("timestamp");
         let updated_at: i64 = row.get("updated_at");
+        if known_ids.contains(&msg_id) && timestamp < since_timestamp {
+            continue;
+        }
         owners.insert((owner_type.clone(), owner_id.clone()));
         messages_by_topic
             .entry((owner_type.clone(), owner_id.clone(), topic_id.clone()))
@@ -964,6 +982,11 @@ pub async fn push_local_changes(
         let topic_key = hub_topic_key(owner_id, topic_id);
         upload_message_batch(client, http_url, sync_token, device_id, &topic_key, messages).await?;
         summary.messages += messages.len();
+        for message in messages {
+            if let Some(id) = json_string(message, "id") {
+                known_ids.insert(id);
+            }
+        }
     }
 
     let deleted_rows =
@@ -984,6 +1007,20 @@ pub async fn push_local_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_message_ids_reads_wire_and_payload_ids() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.messages.push(HubSnapshotMessage {
+            topic_id: "topic-2".to_string(),
+            message_id: None,
+            timestamp: Some(12),
+            payload: json!({ "id": "payload-id" }),
+        });
+        let ids = snapshot_message_ids(&snapshot);
+        assert!(ids.contains("msg-1"));
+        assert!(ids.contains("payload-id"));
+    }
 
     #[test]
     fn status_probe_uses_lightweight_hub_status_path() {
