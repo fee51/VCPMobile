@@ -92,24 +92,59 @@ jobs:
         run: |
           set -euo pipefail
           tools="$ANDROID_SDK_ROOT/build-tools/37.0.0"
-          mkdir -p previous release-artifacts
+          mkdir -p previous release-artifacts diagnostics
+          trap 'echo "::error::Upgrade verification failed at line $LINENO"; for f in diagnostics/*; do test -f "$f" && cat "$f"; done' ERR
+          echo "Downloading previous release for certificate comparison"
           gh release download v1.1.12 --repo "$GITHUB_REPOSITORY" --pattern '*.apk' --dir previous
           mapfile -t apks < <(find src-tauri/gen/android/app/build/outputs/apk -name '*-release.apk' -type f)
-          test "${#apks[@]}" -eq 1
+          printf 'Release APK candidate: %s\n' "${apks[@]}"
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one release APK"
+            exit 1
+          fi
           apk="${apks[0]}"
-          "$tools/apksigner" verify --verbose --print-certs "$apk" > new-cert.txt
-          "$tools/apksigner" verify --verbose --print-certs previous/*.apk > old-cert.txt
-          ! grep -qi 'Android Debug' new-cert.txt
-          sed -n 's/^Signer #1 certificate SHA-256 digest: //p' new-cert.txt > new.sha
-          sed -n 's/^Signer #1 certificate SHA-256 digest: //p' old-cert.txt > old.sha
-          test -s new.sha
-          cmp old.sha new.sha
-          "$tools/aapt" dump badging "$apk" > badging.txt
-          grep -Eq "^package: name='com.vcp.avatar' .*versionCode='1002000' .*versionName='1.2.0'" badging.txt
-          node --input-type=module -e "import fs from 'node:fs';const p=JSON.parse(fs.readFileSync('package.json'));const t=JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json'));if(p.version!=='1.2.0'||t.version!=='1.2.0')process.exit(1)"
+          "$tools/apksigner" verify --verbose --print-certs "$apk" > diagnostics/new-cert.txt 2>&1
+          "$tools/apksigner" verify --verbose --print-certs previous/*.apk > diagnostics/old-cert.txt 2>&1
+          if grep -qi 'Android Debug' diagnostics/new-cert.txt; then
+            echo "::error::Release uses a debug certificate"
+            exit 1
+          fi
+          sed -nE 's/^[[:space:]]*Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' diagnostics/new-cert.txt | tr '[:upper:]' '[:lower:]' > diagnostics/new.sha
+          sed -nE 's/^[[:space:]]*Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' diagnostics/old-cert.txt | tr '[:upper:]' '[:lower:]' > diagnostics/old.sha
+          if ! grep -Eq '^[0-9a-f]{64}$' diagnostics/new.sha || ! grep -Eq '^[0-9a-f]{64}$' diagnostics/old.sha; then
+            cat diagnostics/*cert.txt
+            echo "::error::Could not extract signing certificate fingerprints"
+            exit 1
+          fi
+          if ! cmp diagnostics/old.sha diagnostics/new.sha; then
+            echo "::error::New signing certificate differs from v1.1.12; refusing publication"
+            exit 1
+          fi
+          echo "Signing certificate matches v1.1.12"
+          "$tools/aapt" dump badging "$apk" > diagnostics/badging.txt 2>&1
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const text = fs.readFileSync('diagnostics/badging.txt', 'utf8');
+          const line = text.split(/\r?\n/).find(x => x.startsWith('package:'));
+          console.log('APK metadata:', line);
+          const attrs = Object.fromEntries([...String(line).matchAll(/(\w+)='([^']*)'/g)].map(m => [m[1], m[2]]));
+          for (const [key, expected] of Object.entries({name:'com.vcp.avatar', versionCode:'1002000', versionName:'1.2.0'})) {
+            if (attrs[key] !== expected) throw Error(`${key}: expected ${expected}, actual ${attrs[key]}`);
+          }
+          const p = JSON.parse(fs.readFileSync('package.json'));
+          const t = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json'));
+          if (p.version !== '1.2.0' || t.version !== '1.2.0') throw Error('Source version mismatch');
+          NODE
           cp "$apk" release-artifacts/VCPMobile_v1.2.0_arm64-v8a.apk
           cd release-artifacts
           sha256sum VCPMobile_v1.2.0_arm64-v8a.apk > VCPMobile_v1.2.0_arm64-v8a.apk.sha256
+      - name: Upload verification diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-verification-diagnostics
+          path: diagnostics/
+          if-no-files-found: ignore
       - name: Upload verified artifact
         uses: actions/upload-artifact@v4
         with:
