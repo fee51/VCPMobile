@@ -14,11 +14,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 pub const UPDATE_STATUS_EVENT: &str = "vcp-update://status";
 
-const GITHUB_API_LATEST_URL: &str = "https://api.github.com/repos/MRiecy/VCPMobile/releases/latest";
+const GITHUB_API_LATEST_URL: &str = "https://api.github.com/repos/fee51/VCPMobile/releases/latest";
 /// 回退列表需要拉取多条：列表按创建时间倒序，最新创建的可能不是应用版本
 /// Release（例如同步模块的独立发布），必须过滤后才能取到真正的应用版本。
 const GITHUB_API_LIST_URL: &str =
-    "https://api.github.com/repos/MRiecy/VCPMobile/releases?per_page=10";
+    "https://api.github.com/repos/fee51/VCPMobile/releases?per_page=10";
 const APK_ASSET_SUFFIX: &str = "arm64-v8a.apk";
 const CHECKSUM_ASSET_SUFFIX: &str = "arm64-v8a.apk.sha256";
 const UPDATES_DIR_NAME: &str = "updates";
@@ -29,7 +29,7 @@ const INSTALLING_APK_PREFIX: &str = "installing-";
 #[cfg(any(target_os = "android", test))]
 const STALE_INSTALLER_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_APK_BYTES: u64 = 512 * 1024 * 1024;
-const GITHUB_RELEASE_PATH_PREFIX: &str = "/MRiecy/VCPMobile/releases/download/";
+const GITHUB_RELEASE_PATH_PREFIX: &str = "/fee51/VCPMobile/releases/download/";
 #[cfg(target_os = "android")]
 const LEGACY_FRONTEND_UPDATES_DIR: &str = "frontend_updates";
 #[cfg(target_os = "android")]
