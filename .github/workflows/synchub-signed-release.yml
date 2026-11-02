@@ -109,13 +109,29 @@ jobs:
             echo "::error::Release uses a debug certificate"
             exit 1
           fi
-          sed -nE 's/^[[:space:]]*Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' diagnostics/new-cert.txt | tr '[:upper:]' '[:lower:]' > diagnostics/new.sha
-          sed -nE 's/^[[:space:]]*Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' diagnostics/old-cert.txt | tr '[:upper:]' '[:lower:]' > diagnostics/old.sha
-          if ! grep -Eq '^[0-9a-f]{64}$' diagnostics/new.sha || ! grep -Eq '^[0-9a-f]{64}$' diagnostics/old.sha; then
-            cat diagnostics/*cert.txt
-            echo "::error::Could not extract signing certificate fingerprints"
-            exit 1
-          fi
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import assert from 'node:assert/strict';
+          function extract(text) {
+            assert.match(text, /^Number of signers:\s*1\s*$/m, 'Expected exactly one signer');
+            const hashes = [...text.matchAll(/^[ \t]*(?:Signer #\d+|V\d+(?:\.\d+)? Signer):? certificate SHA-256 digest:[ \t]*([0-9a-fA-F]{64})[ \t]*\r?$/gm)]
+              .map(m => m[1].toLowerCase());
+            const unique = [...new Set(hashes)];
+            assert.equal(unique.length, 1, 'Expected one unique SHA-256 certificate fingerprint');
+            return unique[0];
+          }
+          const hash = 'ab'.repeat(32);
+          for (const label of ['Signer #1', 'V2 Signer:', 'V3 Signer:']) {
+            assert.equal(extract(`Number of signers: 1\n${label} certificate SHA-256 digest: ${hash}\n`), hash);
+          }
+          assert.throws(() => extract(`Number of signers: 2\nSigner #1 certificate SHA-256 digest: ${hash}\n`));
+          assert.throws(() => extract('Number of signers: 1\nV2 Signer: certificate SHA-256 digest: invalid\n'));
+          for (const side of ['new', 'old']) {
+            const text = fs.readFileSync(`diagnostics/${side}-cert.txt`, 'utf8');
+            fs.writeFileSync(`diagnostics/${side}.sha`, extract(text) + '\n');
+          }
+          console.log('Certificate parser regression tests and fingerprint extraction passed');
+          NODE
           if ! cmp diagnostics/old.sha diagnostics/new.sha; then
             echo "::error::New signing certificate differs from v1.1.12; refusing publication"
             exit 1
