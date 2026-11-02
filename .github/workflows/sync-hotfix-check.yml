@@ -2,7 +2,7 @@ name: SyncHub Hotfix Check
 
 on:
   push:
-    branches: ["hotfix/synchub-legacy-attachments"]
+    branches: ["hotfix/synchub-legacy-attachments", "fix/synchub-consistency"]
   workflow_dispatch:
 
 permissions:
@@ -39,7 +39,8 @@ jobs:
       - name: SyncHub, Wire pull, persistence and settings regression tests
         working-directory: src-tauri
         run: |
-          cargo test --locked --lib sync_hub::tests
+          cargo test --locked --lib sync_hub::
+          cargo test --locked --lib sync_service::tests
           cargo test --locked --lib pull_executor::tests
           cargo test --locked --lib db_write_queue::tests
           cargo test --locked --lib settings_manager::tests

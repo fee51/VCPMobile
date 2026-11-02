@@ -908,6 +908,7 @@ async fn upload_message_batch(
     let mut body = Vec::new();
     let mut batch = Vec::new();
     let mut batch_bytes = 64usize;
+    let mut expected_frames = 0usize;
     for message in messages {
         let encoded = serde_json::to_vec(message).map_err(|error| error.to_string())?;
         if !batch.is_empty() && batch_bytes + encoded.len() > 750 * 1024 {
@@ -916,6 +917,7 @@ async fn upload_message_batch(
                     .map_err(|error| error.to_string())?,
             );
             body.push(b'\n');
+            expected_frames += 1;
             batch.clear();
             batch_bytes = 64;
         }
@@ -929,6 +931,9 @@ async fn upload_message_batch(
         );
         body.push(b'\n');
     }
+    if !batch.is_empty() {
+        expected_frames += 1;
+    }
     let response = authorized_post_ndjson(client, &url, sync_token, device_id, body).await?;
     if !response.status().is_success() {
         return Err(format!(
@@ -937,7 +942,8 @@ async fn upload_message_batch(
             response.text().await.unwrap_or_default()
         ));
     }
-    Ok(())
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    validate_message_upload_ack(&body, topic_id, expected_frames)
 }
 
 async fn delete_remote_message(
@@ -984,6 +990,64 @@ fn merge_remote_message_payload(remote: Option<&Value>, local: &Value) -> Value 
     Value::Object(merged)
 }
 
+// Advance only after every upload and deletion has been acknowledged.
+// Scope progress to the endpoint, credential and device; changing accounts must
+// never inherit an unrelated watermark. Missing progress replays from zero.
+fn push_progress_key(http_url: &str, sync_token: &str, device_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let scope = serde_json::to_vec(&(http_url.trim_end_matches('/'), sync_token, device_id))
+        .expect("string tuple serialization");
+    format!("synchub_push_v1:{:x}", Sha256::digest(scope))
+}
+
+pub async fn push_with_checkpoint(
+    client: &reqwest::Client,
+    http_url: &str,
+    sync_token: &str,
+    device_id: &str,
+    pool: &sqlx::SqlitePool,
+    known_ids: &mut HashSet<String>,
+    remote_baseline: &mut Option<HubSnapshot>,
+) -> Result<HubPushSummary, String> {
+    let status = fetch_hub_status(client, http_url, sync_token, device_id).await?;
+    if remote_baseline.as_ref().map(|snapshot| snapshot.latest_cursor) != Some(status.latest_cursor) {
+        *remote_baseline = Some(fetch_snapshot(client, http_url, sync_token, device_id).await?);
+    }
+    let key = push_progress_key(http_url, sync_token, device_id);
+    let stored: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(&key).fetch_optional(pool).await
+        .map_err(|error| format!("read SyncHub push progress: {error}"))?;
+    let since = stored.and_then(|value| value.parse::<i64>().ok()).unwrap_or(0).max(0);
+    let started_at = chrono::Utc::now().timestamp_millis();
+    let summary = push_local_changes(
+        client, http_url, sync_token, device_id, pool, since, known_ids, remote_baseline.as_ref(),
+    ).await?;
+    // Retain an overlap for writes committing near the scan boundary.
+    let next = started_at.saturating_sub(60_000).max(0);
+    sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
+        .bind(&key).bind(next.to_string()).bind(started_at)
+        .execute(pool).await
+        .map_err(|error| format!("save SyncHub push progress: {error}"))?;
+    Ok(summary)
+}
+
+fn validate_message_upload_ack(body: &str, topic_id: &str, expected: usize) -> Result<(), String> {
+    let mut count = 0usize;
+    for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        let ack: Value = serde_json::from_str(line)
+            .map_err(|error| format!("invalid message upload ACK: {error}"))?;
+        if ack.get("topicId").and_then(Value::as_str) != Some(topic_id)
+            || ack.get("success").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(format!("message upload not acknowledged for {topic_id}"));
+        }
+        count += 1;
+    }
+    if count != expected {
+        return Err(format!("message upload ACK count mismatch: expected {expected}, got {count}"));
+    }
+    Ok(())
+}
 pub async fn push_local_changes(
     client: &reqwest::Client,
     http_url: &str,
@@ -992,6 +1056,7 @@ pub async fn push_local_changes(
     pool: &sqlx::SqlitePool,
     since_timestamp: i64,
     known_ids: &mut HashSet<String>,
+    remote_baseline: Option<&HubSnapshot>,
 ) -> Result<HubPushSummary, String> {
     let mut summary = HubPushSummary::default();
     let topic_rows = sqlx::query(
@@ -1031,6 +1096,11 @@ pub async fn push_local_changes(
     .await
     .map_err(|error| format!("load local messages failed: {error}"))?;
 
+    let remote_messages: HashMap<(String, String), &Value> = remote_baseline
+        .map(|snapshot| snapshot.messages.iter().filter_map(|message| {
+            let id = message.message_id.clone().or_else(|| json_string(&message.payload, "id"))?;
+            Some(((message.topic_id.clone(), id), &message.payload))
+        }).collect()).unwrap_or_default();
     let mut messages_by_topic: HashMap<(String, String, String), Vec<Value>> = HashMap::new();
     let mut owners: HashSet<(String, String)> = HashSet::new();
     for row in message_rows {
@@ -1045,14 +1115,27 @@ pub async fn push_local_changes(
         let msg_id: String = row.get("msg_id");
         let timestamp: i64 = row.get("timestamp");
         let updated_at: i64 = row.get("updated_at");
-        if known_ids.contains(&msg_id) && timestamp < since_timestamp {
+        if known_ids.contains(&msg_id) && timestamp.max(updated_at) < since_timestamp {
             continue;
         }
+        let topic_key = format!("{owner_id}/{topic_id}");
+        let remote = remote_messages.get(&(topic_key, msg_id.clone()))
+            .or_else(|| remote_messages.get(&(hub_topic_key(&owner_id, &topic_id), msg_id.clone()))).copied();
+        if let Some(remote) = remote {
+            let remote_version = json_i64(remote, "updatedAt", json_i64(remote, "timestamp", 0));
+            let local_version = timestamp.max(updated_at);
+            if remote_version > local_version {
+                continue;
+            }
+            if remote_version == local_version {
+                if remote.get("content").and_then(Value::as_str) != Some(content.as_str()) {
+                    return Err(format!("SyncHub conflict: {owner_id}/{topic_id}/{msg_id}; local data retained"));
+                }
+                continue;
+            }
+        }
         owners.insert((owner_type.clone(), owner_id.clone()));
-        messages_by_topic
-            .entry((owner_type.clone(), owner_id.clone(), topic_id.clone()))
-            .or_default()
-            .push(json!({
+        let local_payload = json!({
                 "id": msg_id,
                 "role": role,
                 "name": row.get::<Option<String>, _>("name"),
@@ -1064,7 +1147,9 @@ pub async fn push_local_changes(
                 "topicId": topic_id,
                 "isGroupMessage": row.get::<i64, _>("is_group_message") != 0,
                 "finishReason": row.get::<Option<String>, _>("finish_reason"),
-            }));
+            });
+        messages_by_topic.entry((owner_type.clone(), owner_id.clone(), topic_id.clone()))
+            .or_default().push(merge_remote_message_payload(remote, &local_payload));
     }
 
     // Only upload messages newer than the last successful pull/push watermark.
@@ -1493,3 +1578,6 @@ mod tests {
         assert!(!message.content.is_empty());
     }
 }
+#[cfg(test)]
+#[path = "sync_hub_regression_tests.rs"]
+mod regression_tests;

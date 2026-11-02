@@ -1539,280 +1539,146 @@ async fn run_sync_hub_session(
     rx: &mut mpsc::UnboundedReceiver<SyncCommand>,
     connection_status: &Arc<RwLock<String>>,
 ) -> Result<(), String> {
-    emit_sync_log(
-        app_handle,
-        "info",
-        "检测到云端 SyncHub，改用快照同步（电脑/手机共用消息中心）",
-    );
+    emit_sync_log(app_handle, "info", "使用 SyncHub HTTP 双向同步，WebSocket 仅用于变更通知");
     publish_sync_nonterminal_status(app_handle, session_id, connection_status, "connecting").await;
 
     let mut last_cursor = None;
     let mut known_ids = HashSet::new();
-    let pull_started_at = chrono::Utc::now().timestamp_millis();
-    match pull_sync_hub_snapshot(
-        app_handle,
-        session_id,
-        http_client,
-        http_url,
-        sync_token,
-        device_id,
-        write_queue,
-        prerender_enabled,
-        connection_status,
-        &mut last_cursor,
-    )
-    .await
-    {
-        Ok(ids) => known_ids.extend(ids),
-        Err(error) => {
-            publish_sync_error(
-                app_handle,
-                session_id,
-                connection_status,
-                "SYNC_HUB_PULL_FAILED",
-                &error,
-                Vec::new(),
-            )
-            .await;
-            return Err(error);
-        }
-    }
-
-    let mut last_push_watermark = Some(pull_started_at);
-    {
-        let now = chrono::Utc::now().timestamp_millis();
-        let since = last_push_watermark.unwrap_or(pull_started_at);
-        let db = app_handle.state::<DbState>();
-        match crate::vcp_modules::sync::sync_hub::push_local_changes(
-            http_client,
-            http_url,
-            sync_token,
-            device_id,
-            &db.pool,
-            since,
-            &mut known_ids,
-        )
-        .await
-        {
-            Ok(summary) => {
-                last_push_watermark = Some(now.saturating_sub(60_000));
-                emit_sync_log(
-                    app_handle,
-                    "success",
-                    &format!(
-                        "已上传到 SyncHub: entities={}, topics={}, messages={}, deleted={}",
-                        summary.entities,
-                        summary.topics,
-                        summary.messages,
-                        summary.deleted_messages
-                    ),
-                );
-            }
-            Err(error) => {
-                emit_sync_log(app_handle, "warning", &format!("SyncHub 上传失败: {error}"));
-            }
-        }
-    }
-
-    publish_sync_nonterminal_status(app_handle, session_id, connection_status, "open").await;
-
+    let mut remote_baseline = None;
+    let mut ws: Option<tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >> = None;
     let mut retry_delay = Duration::from_secs(3);
+    let mut next_connect = tokio::time::Instant::now();
+    let mut poll = tokio::time::interval(Duration::from_secs(30));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pending_push = true;
+    let mut pending_pull = true;
+
     loop {
         if cancel_token.is_cancelled() {
+            if let Some(socket) = ws.as_mut() {
+                let _ = tokio::time::timeout(WS_OPERATION_TIMEOUT, socket.close(None)).await;
+            }
             return Ok(());
         }
+        // Persisted progress, rather than the session start time, includes
+        // offline edits/deletions. Push before pulling to protect pending edits.
+        if pending_push {
+            pending_push = false;
+            let db = app_handle.state::<DbState>();
+            let result = tokio::select! {
+                _ = cancel_token.cancelled() => return Ok(()),
+                result = crate::vcp_modules::sync::sync_hub::push_with_checkpoint(
+                    http_client, http_url, sync_token, device_id, &db.pool, &mut known_ids, &mut remote_baseline,
+                ) => result,
+            };
+            match result {
+                Ok(summary) => emit_sync_log(app_handle, "success", &format!(
+                    "SyncHub 上传已确认: entities={}, topics={}, messages={}, deleted={}",
+                    summary.entities, summary.topics, summary.messages, summary.deleted_messages,
+                )),
+                Err(error) => {
+                    emit_sync_log(app_handle, "warning", &format!(
+                        "SyncHub 上传失败，保留进度并等待重试: {error}"
+                    ));
+                    // Do not apply a snapshot over unacknowledged local edits.
+                    pending_pull = false;
+                }
+            }
+        }
+        if pending_pull {
+            pending_pull = false;
+            let result = tokio::select! {
+                _ = cancel_token.cancelled() => return Ok(()),
+                result = pull_sync_hub_snapshot(
+                    app_handle, session_id, http_client, http_url, sync_token, device_id,
+                    write_queue, prerender_enabled, connection_status, &mut last_cursor,
+                ) => result,
+            };
+            match result {
+                Ok(ids) => {
+                    known_ids.extend(ids);
+                    publish_sync_nonterminal_status(
+                        app_handle, session_id, connection_status, "open",
+                    ).await;
+                }
+                Err(error) => emit_sync_log(app_handle, "warning", &format!(
+                    "SyncHub 拉取失败，等待下次 HTTP 重试: {error}"
+                )),
+            }
+        }
 
-        let connect_result = tokio::select! {
+        tokio::select! {
             biased;
-            _ = cancel_token.cancelled() => return Ok(()),
-            result = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(ws_url)) => result,
-        };
-
-        let mut ws_stream = match connect_result {
-            Ok(Ok((ws_stream, _))) => ws_stream,
-            Ok(Err(error)) => {
-                emit_sync_log(
-                    app_handle,
-                    "warning",
-                    &format!("SyncHub WebSocket 连接失败: {error}；将继续轮询快照"),
-                );
-                if cancelled_during(cancel_token, retry_delay).await {
-                    return Ok(());
-                }
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
-                match pull_sync_hub_snapshot(
-                    app_handle,
-                    session_id,
-                    http_client,
-                    http_url,
-                    sync_token,
-                    device_id,
-                    write_queue,
-                    prerender_enabled,
-                    connection_status,
-                    &mut last_cursor,
-                )
-                .await
-                {
-                    Ok(ids) => known_ids.extend(ids),
-                    Err(error) => {
-                        emit_sync_log(app_handle, "warning", &format!("SyncHub 轮询失败: {error}"));
+            _ = cancel_token.cancelled() => {}
+            command = rx.recv() => {
+                match command {
+                    Some(SyncCommand::NotifyDelete { .. }) => {
+                        pending_push = true;
+                        pending_pull = true;
                     }
+                    Some(_) => {}
+                    None => return Ok(()),
                 }
-                continue;
             }
-            Err(_) => {
-                emit_sync_log(
-                    app_handle,
-                    "warning",
-                    "SyncHub WebSocket 连接超时；将继续轮询快照",
-                );
-                if cancelled_during(cancel_token, retry_delay).await {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-
-        emit_sync_log(app_handle, "success", "已连接 SyncHub，等待其他设备更新");
-        retry_delay = Duration::from_secs(3);
-        let mut poll = tokio::time::interval(Duration::from_secs(30));
-        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        poll.tick().await;
-        let mut pending_pull = false;
-        let mut pending_push = false;
-
-        loop {
-            if pending_push {
-                pending_push = false;
-                let now = chrono::Utc::now().timestamp_millis();
-                let since = last_push_watermark.unwrap_or_else(|| now - 24 * 60 * 60 * 1000);
-                let db = app_handle.state::<DbState>();
-                match crate::vcp_modules::sync::sync_hub::push_local_changes(
-                    http_client,
-                    http_url,
-                    sync_token,
-                    device_id,
-                    &db.pool,
-                    since,
-                    &mut known_ids,
-                )
-                .await
-                {
-                    Ok(summary) => {
-                        last_push_watermark = Some(now.saturating_sub(60_000));
-                        emit_sync_log(
-                            app_handle,
-                            "success",
-                            &format!(
-                                "已上传到 SyncHub: entities={}, topics={}, messages={}, deleted={}",
-                                summary.entities,
-                                summary.topics,
-                                summary.messages,
-                                summary.deleted_messages
-                            ),
-                        );
-                    }
-                    Err(error) => {
-                        emit_sync_log(app_handle, "warning", &format!("SyncHub 上传失败: {error}"));
-                    }
-                }
+            _ = poll.tick() => {
+                pending_push = true;
                 pending_pull = true;
             }
-            if pending_pull {
-                pending_pull = false;
-                match pull_sync_hub_snapshot(
-                    app_handle,
-                    session_id,
-                    http_client,
-                    http_url,
-                    sync_token,
-                    device_id,
-                    write_queue,
-                    prerender_enabled,
-                    connection_status,
-                    &mut last_cursor,
-                )
-                .await
-                {
-                    Ok(ids) => known_ids.extend(ids),
-                    Err(error) => {
-                        emit_sync_log(
-                            app_handle,
-                            "warning",
-                            &format!("SyncHub 增量拉取失败: {error}"),
-                        );
+            result = async {
+                tokio::time::sleep_until(next_connect).await;
+                tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(ws_url)).await
+            }, if ws.is_none() => {
+                match result {
+                    Ok(Ok((socket, _))) => {
+                        ws = Some(socket);
+                        retry_delay = Duration::from_secs(3);
+                        emit_sync_log(app_handle, "info", "SyncHub 变更通知已连接");
+                    }
+                    _ => {
+                        emit_sync_log(app_handle, "warning",
+                            "SyncHub 变更通知不可用；HTTP 双向轮询继续运行");
+                        next_connect = tokio::time::Instant::now() + retry_delay;
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
                     }
                 }
-                publish_sync_nonterminal_status(app_handle, session_id, connection_status, "open")
-                    .await;
             }
-
-            tokio::select! {
-                biased;
-                _ = cancel_token.cancelled() => {
-                    let _ = ws_stream.close(None).await;
-                    return Ok(());
+            message = async {
+                match ws.as_mut() {
+                    Some(socket) => socket.next().await,
+                    None => std::future::pending().await,
                 }
-                command = rx.recv() => {
-                    match command {
-                        Some(SyncCommand::NotifyDelete { .. }) => {
-                            pending_push = true;
-                        }
-                        Some(_) => {}
-                        None => {
-                            let _ = ws_stream.close(None).await;
-                            return Ok(());
-                        }
-                    }
-                }
-                _ = poll.tick() => {
-                    pending_push = true;
-                    pending_pull = true;
-                }
-                message = ws_stream.next() => {
-                    match message {
-                        Some(Ok(Message::Text(text))) => {
-                            if let Ok(header) = serde_json::from_str::<FrameHeader>(&text) {
-                                if header.frame_type == "REMOTE_CHANGE_AVAILABLE" {
-                                    let source_device_id = serde_json::from_str::<serde_json::Value>(&text)
-                                        .ok()
-                                        .and_then(|value| {
-                                            value.get("sourceDeviceId")
-                                                .or_else(|| value.get("source_device_id"))
-                                                .cloned()
-                                        })
-                                        .and_then(|value| value.as_str().map(str::to_string))
-                                        .unwrap_or_default();
-                                    if source_device_id != device_id {
-                                        emit_sync_log(
-                                            app_handle,
-                                            "info",
-                                            "检测到其他设备更新，开始自动同步",
-                                        );
-                                        pending_pull = true;
-                                    }
+            } => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if value.get("type").and_then(|v| v.as_str())
+                                == Some("REMOTE_CHANGE_AVAILABLE")
+                            {
+                                let source = value.get("sourceDeviceId")
+                                    .or_else(|| value.get("source_device_id"))
+                                    .and_then(|v| v.as_str()).unwrap_or_default();
+                                if source != device_id {
+                                    // Flush pending local data before applying remote changes.
+                                    pending_push = true;
+                                    pending_pull = true;
                                 }
                             }
                         }
-                        Some(Ok(Message::Ping(payload))) => {
-                            let _ = ws_stream.send(Message::Pong(payload)).await;
-                        }
-                        Some(Ok(Message::Close(_))) | None => {
-                            emit_sync_log(app_handle, "warning", "SyncHub WebSocket 已断开，正在重连");
-                            break;
-                        }
-                        Some(Err(error)) => {
-                            emit_sync_log(
-                                app_handle,
-                                "warning",
-                                &format!("SyncHub WebSocket 错误: {error}"),
-                            );
-                            let _ = ws_stream.close(None).await;
-                            break;
-                        }
-                        _ => {}
                     }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if let Some(socket) = ws.as_mut() {
+                            let _ = tokio::time::timeout(
+                                WS_OPERATION_TIMEOUT, socket.send(Message::Pong(payload)),
+                            ).await;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                        ws = None;
+                        next_connect = tokio::time::Instant::now() + retry_delay;
+                    }
+                    _ => {}
                 }
             }
         }
