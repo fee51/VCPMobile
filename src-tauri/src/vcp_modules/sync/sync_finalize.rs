@@ -18,7 +18,7 @@ struct FinalizationStats {
 
 const SQLITE_TOPIC_CHUNK: usize = 300;
 
-async fn finalize_modified_topics(
+pub(crate) async fn finalize_modified_topics(
     db: &DbState,
     modified_topics: &HashSet<TopicKey>,
 ) -> Result<FinalizationStats, String> {

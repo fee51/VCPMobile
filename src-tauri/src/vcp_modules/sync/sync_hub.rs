@@ -9,6 +9,7 @@ use crate::vcp_modules::topic_types::TopicKey;
 
 const MAX_WARNING_SAMPLES: usize = 8;
 
+#[derive(Default)]
 pub(crate) struct BoundedWarnings {
     pub(crate) count: usize,
     pub(crate) samples: Vec<String>,
@@ -16,10 +17,7 @@ pub(crate) struct BoundedWarnings {
 
 impl BoundedWarnings {
     fn new() -> Self {
-        Self {
-            count: 0,
-            samples: Vec::new(),
-        }
+        Self::default()
     }
 
     fn push(&mut self, message: String) {
@@ -641,7 +639,7 @@ pub async fn apply_snapshot(
     snapshot: &HubSnapshot,
     write_queue: &DbWriteQueue,
     prerender_enabled: bool,
-    pool: &sqlx::SqlitePool,
+    db: &crate::vcp_modules::db_manager::DbState,
 ) -> Result<HubApplySummary, String> {
     let grouped = group_snapshot(snapshot);
     let mut summary = HubApplySummary {
@@ -784,7 +782,7 @@ pub async fn apply_snapshot(
     write_queue.flush().await?;
     // Snapshot imports bypass the ordinary Wire phase controller. Explicitly
     // finalize counts/hashes before notifying the UI, including empty topics.
-    crate::vcp_modules::sync::sync_finalize::finalize_modified_topics(pool, &modified_topics)
+    crate::vcp_modules::sync::sync_finalize::finalize_modified_topics(db, &modified_topics)
         .await?;
     summary.legacy_attachment_warnings = warnings.count;
     summary.warning_samples = warnings.samples;
@@ -798,10 +796,10 @@ pub async fn pull_and_apply(
     device_id: &str,
     write_queue: &DbWriteQueue,
     prerender_enabled: bool,
-    pool: &sqlx::SqlitePool,
+    db: &crate::vcp_modules::db_manager::DbState,
 ) -> Result<HubApplySummary, String> {
     let snapshot = fetch_snapshot(client, http_url, sync_token, device_id).await?;
-    apply_snapshot(&snapshot, write_queue, prerender_enabled, pool).await
+    apply_snapshot(&snapshot, write_queue, prerender_enabled, db).await
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

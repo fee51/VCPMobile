@@ -20,7 +20,6 @@ use crate::vcp_modules::sync_types::{
     TopicDiffResultFrame, TopicDiffState,
 };
 use crate::vcp_modules::topic_types::{OwnerKey, TopicKey};
-#[cfg(test)]
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1489,11 +1488,12 @@ async fn pull_sync_hub_snapshot(
         return Ok(HashSet::new());
     }
     let remote_ids = crate::vcp_modules::sync::sync_hub::snapshot_message_ids(&snapshot);
+    let db = app_handle.state::<DbState>();
     let summary = crate::vcp_modules::sync::sync_hub::apply_snapshot(
         &snapshot,
         write_queue,
         prerender_enabled,
-        &app_handle.state::<DbState>().pool,
+        db.inner(),
     )
     .await?;
     crate::vcp_modules::sync::sync_finalize::invalidate_sync_entity_caches(app_handle);
@@ -1756,7 +1756,7 @@ async fn run_sync_hub_session(
                 }
                 command = rx.recv() => {
                     match command {
-                        Some(SyncCommand::StartManualSync) | Some(SyncCommand::NotifyDelete { .. }) => {
+                        Some(SyncCommand::NotifyDelete { .. }) => {
                             pending_push = true;
                         }
                         Some(_) => {}
