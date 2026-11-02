@@ -10,7 +10,7 @@ use tauri::{AppHandle, Manager};
 pub struct SyncFinalizer;
 
 #[derive(Debug)]
-struct FinalizationStats {
+pub(crate) struct FinalizationStats {
     bubbled_topics: usize,
     affected_agents: usize,
     affected_groups: usize,
